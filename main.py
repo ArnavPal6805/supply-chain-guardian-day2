@@ -38,6 +38,8 @@ from models import (  # noqa: E402
     SimulateRequest,
 )
 from orchestrator import LogBus  # noqa: E402
+from mitigation_engine import HumanDecisionType, MitigationAction, ValidationRequest  # noqa: E402
+from remediation_agent import ConfirmApply, PrepareApply, StartRemediation  # noqa: E402
 
 
 def default_repo() -> str:
@@ -85,15 +87,19 @@ def create_app(engine: Engine, bus: LogBus, allowed_hosts: Optional[list] = None
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
-        return FileResponse(PROJECT_ROOT / "static" / "index.html", media_type="text/html")
+        return FileResponse(PROJECT_ROOT / "static" / "index.html", media_type="text/html",
+                            headers={"Cache-Control": "no-store"})   # always serve the current dashboard
 
     @app.get("/api/config")
     async def config() -> dict:
         from orchestrator import LLMClient
         llm = LLMClient()
-        active = llm.enabled and engine.use_llm
+        active = llm.enabled and engine.use_llm and LLMClient.sdk_available(llm.provider)
+        missing = llm.enabled and engine.use_llm and not LLMClient.sdk_available(llm.provider)
         return {"default_repo": default_repo(), "llm_provider": llm.provider if active else "none",
-                "llm_model": llm.model if active else None, "offline": os.environ.get("SCG_OFFLINE") == "1"}
+                "llm_model": llm.model if active else None, "offline": os.environ.get("SCG_OFFLINE") == "1",
+                "llm_error": (f"{llm.provider} key found but its SDK is not installed for {sys.executable}; "
+                              f"start the server with .venv/bin/python") if missing else None}
 
     @app.get("/api/result")
     async def result() -> Any:
@@ -133,6 +139,48 @@ def create_app(engine: Engine, bus: LogBus, allowed_hosts: Optional[list] = None
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return engine.daemon.start(req.repo, req.interval, req.demo_drift).model_dump(mode="json")
+
+    STATE = engine.state   # STATE["mitigations"][finding_id], STATE["decision_log"] (shared with the engine)
+
+    @app.get("/api/mitigations")
+    async def mitigations() -> Any:
+        return {"mitigations": {k: v.model_dump(mode="json") for k, v in STATE["mitigations"].items()},
+                "decision_log": STATE["decision_log"][-200:]}
+
+    @app.post("/api/mitigations/validate")
+    async def validate_mitigation(req: ValidationRequest) -> Any:
+        if req.finding_id not in STATE["mitigations"]:
+            raise HTTPException(status_code=404, detail=f"no mitigation package for finding {req.finding_id}")
+        pkg = await run(engine.validate_mitigation, req.finding_id, req.decision, req.reviewer, req.justification,
+                        req.chosen_candidate_id)
+        return pkg.model_dump(mode="json")
+
+    # ---- agentic remediation -------------------------------------------------- #
+    @app.post("/api/remediation/start")
+    async def remediation_start(req: StartRemediation) -> Any:
+        return await run(engine.start_remediation, req.finding_ids, req.max_iterations, req.run_tests, req.use_llm)
+
+    @app.get("/api/remediation/session")
+    async def remediation_session() -> Any:
+        return engine.remediation_state()
+
+    @app.post("/api/remediation/stop")
+    async def remediation_stop() -> Any:
+        return engine.stop_remediation()
+
+    @app.post("/api/remediation/prepare-apply")
+    async def remediation_prepare(req: PrepareApply) -> Any:
+        if engine.remediation is None:
+            raise HTTPException(status_code=409, detail="no remediation session")
+        return await run(engine.remediation.prepare_apply, req.accepted_change_ids)
+
+    @app.post("/api/remediation/apply")
+    async def remediation_apply(req: ConfirmApply) -> Any:
+        if engine.remediation is None:
+            raise HTTPException(status_code=409, detail="no remediation session")
+        if not req.confirm:
+            raise HTTPException(status_code=400, detail="explicit confirmation required (confirm: true)")
+        return await run(engine.remediation.confirm_apply, req.digest)
 
     @app.post("/api/chat")
     async def chat(req: ChatRequest) -> Any:
@@ -188,7 +236,8 @@ def print_cards(cards: list, limit: int = 8) -> None:
     colour = {"CRITICAL": "red", "HIGH": "dark_orange", "MEDIUM": "yellow", "LOW": "green"}
     for c in cards[:limit]:
         sev = c.finding.severity.value
-        math = " ".join([f"{c.risk.base}"] + [f"{d.value:+d}" for d in c.risk.deltas]) + f" = {c.risk.total}"
+        math = " + ".join(f"{x.points:g}" for x in c.risk.components if x.max_points) + \
+            "".join(f" [{a.effect}]" for a in c.risk.adjustments) + f" = {c.risk.total}/100"
         v = c.validation
         body = (f"[bold]1. Finding[/] {escape(c.finding.title)}\n   purl: {escape(str(c.finding.purl))}  "
                 f"ids: {escape(', '.join(c.finding.advisory_ids[:3]))}\n"
@@ -196,15 +245,19 @@ def print_cards(cards: list, limit: int = 8) -> None:
                 f"[dim]{escape(c.location.code_snippet[:500])}[/]\n"
                 f"[bold]3. Attack path[/] (depth {c.attack_path.call_chain_depth})\n   " +
                 "\n   ".join(escape(h) for h in c.attack_path.hops[:6]) +
-                f"\n[bold]4. Risk Elo[/] {math} -> {sev}\n   " +
-                "\n   ".join(escape(f"{d.value:+d} {d.label}") for d in c.risk.deltas) +
+                f"\n[bold]4. Risk[/] {math} -> {sev} · {c.risk.priority} · confidence {c.risk.confidence_level} "
+                f"({c.risk.confidence:.2f})\n   " +
+                "\n   ".join(escape(f"{x.points:g}/{x.max_points:g} {x.factor}: {x.detail}") for x in c.risk.components) +
+                "".join("\n   " + escape(f"{a.effect} {a.label}") for a in c.risk.adjustments) +
+                "".join("\n   [dim]" + escape(f"{x.name}: {x.value}" + (f" (as of {x.as_of})" if x.as_of else "")) + "[/]"
+                        for x in c.risk.factors.sources[:6]) +
                 f"\n[bold]5. Remediation[/] {escape(c.remediation.summary)}\n   $ {escape(c.remediation.fix_command)}\n" +
                 (f"   root cause ({escape(c.remediation.root_cause_kind or '')}): {escape(c.remediation.root_cause)}\n"
                  if c.remediation.root_cause else "") +
                 f"[dim]{escape(c.narrative[:400])}[/]\n"
                 f"Validator: {'[green]PASSED[/]' if v and v.passed else '[red]FAILED[/]'} (author={c.author}"
                 f"{', fallback' if v and v.fell_back_to_deterministic else ''})")
-        con.print(Panel(body, title=f"[{colour[sev]}]{c.finding.finding_id}  {sev}  Elo {c.risk.total}[/]",
+        con.print(Panel(body, title=f"[{colour[sev]}]{c.finding.finding_id}  {sev}  {c.risk.total}/100  {c.risk.priority}[/]",
                         border_style=colour[sev]))
 
 
@@ -218,12 +271,19 @@ def print_scan(res: Any) -> None:
               f"   (sbom={res.sbom_source}, advisories={res.vuln_source})")
     for n in res.notes:
         con.print(f"[yellow]note:[/] {escape(n)}")
-    t = Table(title="Findings (Risk Elo, highest first)", show_lines=False)
-    for col in ("ID", "Elo", "Severity", "Reach", "Title"):
+    intel = res.intel or {}
+    if intel:
+        con.print(f"[bold]Threat intel[/] CISA KEV {'catalog ' + str(intel.get('kev_version')) if intel.get('kev_checked') else 'not checked'}"
+                  f" · FIRST EPSS {('data ' + str(intel.get('epss_date'))) if intel.get('epss_checked') else 'not checked'}")
+    t = Table(title="Findings (risk score 0-100, highest first)", show_lines=False)
+    for col in ("ID", "Score", "Level", "Priority", "Conf.", "EPSS", "KEV", "Reach", "Exposure", "Title"):
         t.add_column(col)
     for f in res.findings[:40]:
-        reach = {True: "called", False: "not called", None: "-"}[f.elo.factors.is_symbol_called]
-        t.add_row(f.id, str(f.elo.total), f.elo.severity.value, reach, escape(f.title[:90]))
+        x = f.risk.factors
+        t.add_row(f.id, str(f.risk.total), f.risk.severity.value, f.risk.priority.split()[0], f.risk.confidence_level,
+                  f"{x.epss:.3f}" if x.epss is not None else "-", {True: "YES", False: "no", None: "-"}[x.kev],
+                  x.reachability if x.threat_class is None else "-", x.exposure if x.threat_class is None else "-",
+                  escape(f.title[:70]))
     con.print(t)
     st = res.dependency_stats
     if st.packages:
@@ -236,7 +296,7 @@ def print_scan(res: Any) -> None:
         for col in ("Group", "Worst", "Findings", "Action", "Command"):
             g.add_column(col)
         for grp in res.fix_groups[:10]:
-            g.add_row(grp.id, f"{grp.max_severity.value} {grp.max_elo}", str(len(grp.findings)),
+            g.add_row(grp.id, f"{grp.max_severity.value} {grp.max_score}", str(len(grp.findings)),
                       escape(grp.action[:90]), escape(grp.command))
         con.print(g)
     info = [a for a in res.anomalies if not a.scored]
@@ -245,11 +305,103 @@ def print_scan(res: Any) -> None:
     print_cards(res.cards, limit=5)
 
 
+def print_remediation(engine: Any) -> None:
+    from rich.markup import escape
+    from rich.table import Table
+    con = _console()
+    a = engine.remediation
+    m = a.mem
+    con.print(f"\n[bold]Remediation session {m.session_id}[/] driver={m.driver} status={m.status}\n{escape(m.summary)}")
+    t = Table(title="Target findings (status decided by the independent validator)")
+    for col in ("Finding", "Severity", "Score", "Status", "Reason"):
+        t.add_column(col)
+    for x in m.targets:
+        t.add_row(escape(x.key[:70]), x.severity, str(x.score), x.status, escape(x.reason[:80]))
+    con.print(t)
+    for v in m.validations:
+        con.print(f"  iteration {v.iteration}: verdict {v.verdict}, max risk {v.risk.get('max')}, resolved {len(v.resolved_vs_baseline)}, "
+                  f"new {len(v.new_vs_baseline)}, graph {'ok' if v.graph_consistency.get('ok') else 'INCONSISTENT'}, tests {v.tests.get('status')}")
+    for c in m.changes:
+        con.print(f"[bold]{c.change_id}[/] {c.tool} ({c.status}, impact {c.impact}) {escape(c.reason[:100])}")
+        for f in c.files:
+            con.print(f"[dim]{escape(f.diff[:1500])}[/]")
+    patch = a.audit_path.with_suffix(".patch")
+    patch.write_text("".join(a.candidate_diff().values()), encoding="utf-8")
+    con.print(f"\nCandidate patch: {patch}\nAudit log: {a.audit_path}\n"
+              "Nothing was written to the repository. Review and approve individual changes in the dashboard "
+              "(Remediation tab) to apply them.")
+
+
+def validate_interactively(engine: Any, only_gated: bool = True) -> None:
+    """--validate: candidate comparison per finding, then approve / accept risk / reject & escalate."""
+    from rich.markup import escape
+    from rich.table import Table
+    con = _console()
+    pkgs = sorted(engine.state["mitigations"].values(), key=lambda p: (not p.requires_human_validation, -p.risk_score))
+    if only_gated:
+        pkgs = [p for p in pkgs if p.requires_human_validation and p.human_validation.decision == HumanDecisionType.PENDING]
+    if not pkgs:
+        con.print("[green]No findings are waiting for human validation.[/]")
+        return
+    interactive = sys.stdin.isatty()
+    reviewer = os.environ.get("USER") or "reviewer"
+    if interactive:
+        reviewer = input(f"Reviewer name [{reviewer}]: ").strip() or reviewer
+    con.print(f"\n[bold]{len(pkgs)} finding(s) need a human decision[/] (Python never applies a fix; this records the decision)")
+    for p in pkgs:
+        t = Table(title=f"{p.finding_id}  {escape(p.package_name)}@{escape(p.current_version)}  risk {p.risk_score}/100"
+                        f"{'  production' if p.is_production else '  dev/test'}", show_lines=False)
+        for col in ("#", "Candidate", "Source", "Action", "Target", "SemVer", "Compat Risk", "Fit Score"):
+            t.add_column(col)
+        for i, c in enumerate(p.candidates, 1):
+            rec = " *" if c.candidate_id == p.recommended_candidate_id else ""
+            t.add_row(str(i), c.candidate_id + rec, c.source + (f" +{','.join(c.also_reported_by)}" if c.also_reported_by else ""),
+                      c.action_type.value, escape(c.target_version_or_ref), c.semver_jump, c.compatibility_risk.value, str(c.fit_score))
+        con.print(t)
+        for r in p.escalation_reasons:
+            con.print(f"  [yellow]gate:[/] {escape(r)}")
+        con.print(f"  [dim]{escape(p.ai_tradeoff_summary)} ({p.summary_author})[/]")
+        for c in p.candidates:
+            if c.breaking_changes:
+                con.print(f"  [red]{c.candidate_id} breaking:[/] " + escape("; ".join(c.breaking_changes[:3])))
+        if not interactive:
+            continue
+        while True:
+            ans = input("  [number]=approve candidate, a=accept risk, r=reject & escalate, s=skip, q=quit > ").strip().lower()
+            try:
+                if ans == "q":
+                    return
+                if ans in ("", "s"):
+                    break
+                if ans == "a":
+                    why = input("  justification (min 8 chars): ")
+                    engine.validate_mitigation(p.finding_id, HumanDecisionType.ACCEPTED_RISK, reviewer, why)
+                elif ans == "r":
+                    why = input("  reason (optional): ")
+                    engine.validate_mitigation(p.finding_id, HumanDecisionType.REJECTED_ESCALATED, reviewer, why)
+                elif ans.isdigit() and 1 <= int(ans) <= len(p.candidates):
+                    cand = p.candidates[int(ans) - 1]
+                    why = input("  note (optional): ")
+                    engine.validate_mitigation(p.finding_id, HumanDecisionType.APPROVED, reviewer, why, cand.candidate_id)
+                    con.print(f"  approved. Apply it yourself when ready:\n  $ {escape(cand.apply_command)}\n"
+                              f"  rollback: $ {escape(cand.rollback_command)}")
+                else:
+                    con.print("  [yellow]unknown choice[/]")
+                    continue
+                break
+            except ValueError as exc:
+                con.print(f"  [red]{escape(str(exc))}[/]")
+    con.print(f"[green]Decisions are logged in {engine._decision_file(engine.ctx.repo)}[/]")
+
+
 def main(argv: Optional[list] = None) -> int:
     p = argparse.ArgumentParser(description="Continuous agentic software supply-chain security (read-only).")
     p.add_argument("--repo", default=default_repo(),
                    help="local path or public GitHub URL (https://github.com/owner/repo[/tree/<branch>]) of the target repository")
-    p.add_argument("--mode", default="scan", choices=["scan", "check-pkg", "replay", "daemon", "simulate-attack", "serve"])
+    p.add_argument("--mode", default="scan", choices=["scan", "check-pkg", "replay", "daemon", "simulate-attack", "serve", "remediate"])
+    p.add_argument("--iterations", type=int, default=5, help="remediate: iteration limit (1-10)")
+    p.add_argument("--findings", default="", help="remediate: comma-separated finding ids (default: top findings)")
+    p.add_argument("--sandbox-tests", action="store_true", help="remediate: run the project's tests in a Docker sandbox")
     p.add_argument("--pkg", help="candidate package for check-pkg, e.g. reqeusts@1.0.0 or pypi:requests==2.31.0")
     p.add_argument("--commits", type=int, default=5)
     p.add_argument("--interval", type=int, default=30)
@@ -262,6 +414,9 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--no-cache", action="store_true")
     p.add_argument("--keep-sandbox", action="store_true", help="simulate-attack: keep the temp sandbox for inspection")
     p.add_argument("--json-out", help="write the result as JSON to this path")
+    p.add_argument("--validate", action="store_true",
+                   help="scan: show mitigation candidates and record human decisions for gated findings")
+    p.add_argument("--validate-all", action="store_true", help="with --validate: also review auto-approved findings")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--allow-remote", action="store_true",
@@ -283,6 +438,13 @@ def main(argv: Optional[list] = None) -> int:
         hosts = LOOPBACK_HOSTS + ([args.host] if args.allow_remote else [])
         app = create_app(engine, bus, hosts)
         print(f"Dashboard: http://127.0.0.1:{args.port}/   (default repo: {args.repo})")
+        from orchestrator import LLMClient
+        _llm = LLMClient()
+        if _llm.enabled and not args.no_llm:
+            ok = LLMClient.sdk_available(_llm.provider)
+            print(f"LLM: {_llm.provider} ({_llm.model}) via {sys.executable}" if ok else
+                  f"WARNING: {_llm.provider} key found but its SDK is missing for {sys.executable}. "
+                  f"Use .venv/bin/python main.py ... (LLM features are off until then).")
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
         return 0
 
@@ -292,6 +454,9 @@ def main(argv: Optional[list] = None) -> int:
             result = engine.scan(args.repo, use_llm=not args.no_llm, resolve_lockfile=args.resolve_lockfile,
                                  use_cache=not args.no_cache)
             print_scan(result)
+            if args.validate or args.validate_all:
+                validate_interactively(engine, only_gated=not args.validate_all)
+                result = engine.refresh_result()
         elif args.mode == "check-pkg":
             if not args.pkg:
                 p.error("--pkg is required for check-pkg")
@@ -324,13 +489,19 @@ def main(argv: Optional[list] = None) -> int:
                 pass
             result = engine.daemon.status
             print(result.model_dump_json(indent=2))
+        elif args.mode == "remediate":
+            engine.scan(args.repo, use_llm=not args.no_llm, resolve_lockfile=args.resolve_lockfile)
+            ids = [x.strip() for x in args.findings.split(",") if x.strip()]
+            engine.start_remediation(ids, args.iterations, args.sandbox_tests, use_llm=not args.no_llm, background=False)
+            print_remediation(engine)
+            result = engine.remediation.mem
         else:  # simulate-attack
             result = engine.simulate_attack(args.repo, keep_sandbox=args.keep_sandbox)
             con = _console()
             print_cards(result.cards)
             con.print(f"\n[bold {'green' if result.blocked else 'red'}]"
                       f"{'ATTACK INTERCEPTED AND BLOCKED' if result.blocked else 'ATTACK NOT FULLY BLOCKED'}[/] "
-                      f"max Risk Elo {result.max_elo}; sandbox removed={result.sandbox_removed}")
+                      f"max risk {result.max_score}/100; sandbox removed={result.sandbox_removed}")
             for n in result.safety_notes:
                 con.print(f"[dim]safety: {n}[/]")
     except ValueError as exc:

@@ -130,16 +130,28 @@ class Vulnerability(BaseModel):
     version: str
     purl: str
     summary: str = ""
+    details: str = ""
     cvss_score: Optional[float] = None
     cvss_vector: Optional[str] = None
     severity_label: Optional[str] = None
     patched_versions: List[str] = Field(default_factory=list)
     fixed_in: Optional[str] = None       # fix for the affected range that contains `version`
     affected_since: Optional[str] = None
+    cvss_source: Optional[str] = None    # osv-vector | nvd | label-estimate | scanner-group | demo
+    # Threat intelligence (filled by threat_intel.enrich; None = not checked / unavailable)
+    cve: Optional[str] = None
+    epss: Optional[float] = None
+    epss_percentile: Optional[float] = None
+    kev: Optional[bool] = None
+    kev_date_added: Optional[str] = None
+    kev_ransomware: Optional[bool] = None
+    intel_sources: List["IntelSource"] = Field(default_factory=list)
     references: List[str] = Field(default_factory=list)
+    fix_commits: List[str] = Field(default_factory=list)   # upstream fix commit URLs (github.com/o/r/commit/sha)
     affected_functions: List[str] = Field(default_factory=list)
     source: str = "osv-api"              # osv-scanner | osv-api | demo | drift-demo
     published: Optional[str] = None
+    modified: Optional[str] = None
 
     @property
     def is_malicious(self) -> bool:
@@ -201,7 +213,7 @@ class AttackNode(BaseModel):
     purl: Optional[str] = None
     file: Optional[str] = None
     line: Optional[int] = None
-    risk_elo: Optional[int] = None
+    risk_score: Optional[int] = None
     severity: Optional[Severity] = None
     finding_ids: List[str] = Field(default_factory=list)
     attrs: Dict[str, Any] = Field(default_factory=dict)
@@ -215,33 +227,64 @@ class AttackEdge(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Risk Elo
+# Risk score (deterministic engine: risk_engine.compute_risk)
 # --------------------------------------------------------------------------- #
-class EloFactors(BaseModel):
-    """Inputs to the locked formula. Every boolean must be backed by evidence."""
+Reachability = Literal["confirmed", "imported", "unknown", "not_called", "not_imported"]
+Exposure = Literal["public_route", "network_service", "internal", "unknown"]
+
+
+class IntelSource(BaseModel):
+    """Where a risk input came from and how fresh it is."""
+    name: str                            # OSV | NVD | FIRST EPSS | CISA KEV | static analysis | agent
+    value: str
+    as_of: Optional[str] = None          # last-updated timestamp / dataset date reported by the source
+    url: Optional[str] = None
+
+
+class RiskFactors(BaseModel):
+    """Inputs to the scoring engine. Unknown inputs stay None/"unknown" and are scored neutrally."""
     cvss: Optional[float] = None
-    pre_cve_threat: bool = False
-    static_hygiene: bool = False              # unpinned action / tag without digest (base 1000)
-    is_symbol_called: Optional[bool] = None   # None = unknown (no symbol data) -> 0
-    auto_exec_hook: bool = False
-    public_route: bool = False
+    cvss_source: Optional[str] = None
+    epss: Optional[float] = None
+    epss_percentile: Optional[float] = None
+    kev: Optional[bool] = None                   # None = catalogue not checked
+    reachability: Reachability = "unknown"
+    reachability_source: str = "static"          # static | agent-verified
+    exposure: Exposure = "unknown"
+    exposure_source: str = "static"              # static | override
     dev_or_test_only: bool = False
+    dependency_depth: Optional[int] = None       # context only: never scored
+    threat_class: Optional[str] = None           # non-CVE findings: malicious, tamper, typosquat, ...
+    auto_exec_hook: bool = False
     provenance_flags: List[str] = Field(default_factory=list)
+    version_uncertain: bool = False              # version is a semver-range floor (no lockfile)
+    demo_data: bool = False
+    sources: List[IntelSource] = Field(default_factory=list)
 
 
-class EloDelta(BaseModel):
+class RiskComponent(BaseModel):
+    factor: str
+    points: float
+    max_points: float
+    detail: str
+
+
+class RiskAdjustment(BaseModel):
     label: str
-    value: int
+    effect: str                          # "floor 80", "x0.6", "+10", "= 100"
 
 
-class EloBreakdown(BaseModel):
-    factors: EloFactors
-    base: int
-    base_reason: str
-    deltas: List[EloDelta] = Field(default_factory=list)
-    total: int
+class RiskBreakdown(BaseModel):
+    factors: RiskFactors
+    components: List[RiskComponent] = Field(default_factory=list)
+    adjustments: List[RiskAdjustment] = Field(default_factory=list)
+    total: int                           # 0-100
     severity: Severity
-    formula_version: str = "elo-v1"
+    priority: str                        # P1 act now | P2 fix soon | P3 plan | P4 monitor
+    confidence: float
+    confidence_level: Literal["high", "medium", "low"]
+    confidence_reasons: List[str] = Field(default_factory=list)
+    formula_version: str = "risk-v2"
 
 
 # --------------------------------------------------------------------------- #
@@ -287,7 +330,7 @@ class FixGroup(BaseModel):
     findings: List[str] = Field(default_factory=list)
     packages: List[str] = Field(default_factory=list)
     max_severity: Severity
-    max_elo: int
+    max_score: int
     runtime: bool = False
 
 
@@ -303,7 +346,7 @@ class Finding(BaseModel):
     version: Optional[str] = None
     advisory_ids: List[str] = Field(default_factory=list)
     sink_node: str
-    elo: EloBreakdown
+    risk: RiskBreakdown
     call_chain_depth: Optional[int] = None
     primary_evidence: Optional[Evidence] = None
     symbols: List[str] = Field(default_factory=list)
@@ -353,18 +396,19 @@ class EvidenceCard(BaseModel):
     finding: CardFinding
     location: CardLocation
     attack_path: CardAttackPath
-    risk: EloBreakdown                  # field 4 (risk_elo == risk.total)
+    risk: RiskBreakdown                 # field 4 (risk score == risk.total)
     remediation: CardRemediation
     narrative: str = ""
     author: Literal["llm", "deterministic"] = "deterministic"
     validation: Optional[ValidationReport] = None
 
     @property
-    def risk_elo(self) -> int:
+    def risk_score(self) -> int:
         return self.risk.total
 
 
 AdmissionResult.model_rebuild()
+Vulnerability.model_rebuild()
 
 
 # --------------------------------------------------------------------------- #
@@ -410,6 +454,9 @@ class ScanResult(BaseModel):
     dependency_graph: GraphPayload = Field(default_factory=GraphPayload)   # every discovered component
     dependency_stats: DependencyStats = Field(default_factory=DependencyStats)
     fix_groups: List[FixGroup] = Field(default_factory=list)
+    intel: Dict[str, Any] = Field(default_factory=dict)   # KEV/EPSS check status + dataset versions
+    mitigations: Dict[str, Any] = Field(default_factory=dict)  # finding id -> MitigationDecisionPackage (json)
+    decision_log: List[Dict[str, Any]] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
     finished_at: datetime = Field(default_factory=utcnow)
 
@@ -439,7 +486,7 @@ class SimulationResult(BaseModel):
     anomalies: List[StaticAnomaly]
     cards: List[EvidenceCard]
     blocked: bool
-    max_elo: int
+    max_score: int
     graph: GraphPayload = Field(default_factory=GraphPayload)
     safety_notes: List[str] = Field(default_factory=list)
 

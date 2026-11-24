@@ -144,7 +144,7 @@ def build_dependency_graph(sbom: Sbom, findings: Iterable[Finding], project_name
         if not f.purl:
             continue
         ids.setdefault(f.purl, []).append(f.id)
-        if f.purl not in worst or f.elo.total > worst[f.purl].elo.total:
+        if f.purl not in worst or f.risk.total > worst[f.purl].risk.total:
             worst[f.purl] = f
     comp = idx.comp
     manifest_occ = {c.purl: next((o for o in c.occurrences if o.file_path == "package.json"), None)
@@ -180,8 +180,8 @@ def build_dependency_graph(sbom: Sbom, findings: Iterable[Finding], project_name
         nodes.append(AttackNode(
             id=c.purl, label=f"{c.name}@{c.version}",
             tier=Tier.DIRECT_PKG if c.purl in idx.direct else Tier.TRANSITIVE_PKG,
-            depth=idx.depth.get(c.purl, 0), purl=c.purl, risk_elo=f.elo.total if f else None,
-            severity=f.elo.severity if f else None, finding_ids=sorted(ids.get(c.purl, [])),
+            depth=idx.depth.get(c.purl, 0), purl=c.purl, risk_score=f.risk.total if f else None,
+            severity=f.risk.severity if f else None, finding_ids=sorted(ids.get(c.purl, [])),
             attrs={"dev": c.is_dev, "version_source": c.version_source,
                    "direct_inferred": c.purl in idx.inferred,
                    "declared_spec": root_specs.get(c.purl),

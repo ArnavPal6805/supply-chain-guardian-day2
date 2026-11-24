@@ -40,7 +40,7 @@
         <svg viewBox="0 0 24 24" class="w-6 h-6 text-red-500" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 5v6c0 5 3.4 9.3 8 11 4.6-1.7 8-6 8-11V5l-8-3Z"/><path d="m9 12 2 2 4-4"/></svg>
         <div>
           <div class="text-sm font-semibold text-slate-100 tracking-wide">SUPPLY-CHAIN GUARDIAN</div>
-          <div class="text-[10px] uppercase tracking-widest text-slate-500">read-only &middot; attack-tree elo</div>
+          <div class="text-[10px] uppercase tracking-widest text-slate-500">read-only &middot; evidence-based risk</div>
         </div>
       </div>
       <label class="flex items-center gap-2 text-xs flex-1 min-w-[220px]">
@@ -70,8 +70,8 @@
   <section class="px-4 pt-4 grid grid-cols-2 lg:grid-cols-4 gap-3">
     <div class="rounded-lg bg-ink-900 border border-ink-700 p-3"><div class="text-[10px] uppercase tracking-widest text-slate-500">Total Components</div><div id="kTotal" class="text-2xl font-semibold font-mono text-slate-100">&ndash;</div><div id="kSrc" class="text-[10px] text-slate-500 font-mono truncate">no scan yet</div></div>
     <div class="rounded-lg bg-ink-900 border border-ink-700 p-3"><div class="text-[10px] uppercase tracking-widest text-slate-500">Raw Scanner Alerts</div><div id="kRaw" class="text-2xl font-semibold font-mono text-amber-300">&ndash;</div><div class="text-[10px] text-slate-500">advisories + scored static anomalies</div></div>
-    <div class="rounded-lg bg-ink-900 border border-red-900/60 p-3"><div class="text-[10px] uppercase tracking-widest text-red-400">Actionable Critical Risks</div><div id="kCrit" class="text-2xl font-semibold font-mono text-red-400">&ndash;</div><div class="text-[10px] text-slate-500">Risk Elo &ge; 1800</div></div>
-    <div class="rounded-lg bg-ink-900 border border-emerald-900/60 p-3"><div class="text-[10px] uppercase tracking-widest text-emerald-400">Downgraded Noise</div><div id="kNoise" class="text-2xl font-semibold font-mono text-emerald-400">&ndash;</div><div class="text-[10px] text-slate-500">Risk Elo &lt; 1000</div></div>
+    <div class="rounded-lg bg-ink-900 border border-red-900/60 p-3"><div class="text-[10px] uppercase tracking-widest text-red-400">Actionable Critical Risks</div><div id="kCrit" class="text-2xl font-semibold font-mono text-red-400">&ndash;</div><div class="text-[10px] text-slate-500">risk score &ge; 80 / 100</div></div>
+    <div class="rounded-lg bg-ink-900 border border-emerald-900/60 p-3"><div class="text-[10px] uppercase tracking-widest text-emerald-400">Low Priority</div><div id="kNoise" class="text-2xl font-semibold font-mono text-emerald-400">&ndash;</div><div class="text-[10px] text-slate-500">risk score &lt; 30 / 100</div></div>
   </section>
   <div id="notes" class="px-4 pt-2 space-y-1"></div>
 
@@ -117,9 +117,10 @@
 
     <section class="xl:col-span-5 rounded-lg bg-ink-900 border border-ink-700 flex flex-col overflow-hidden min-h-[480px]">
       <nav class="flex border-b border-ink-700 text-xs">
-        <button data-tab="cards" class="tab tab-active px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-slate-200">Evidence Cards <span id="cardCount" class="font-mono text-slate-500"></span></button>
+        <button data-tab="cards" class="tab tab-active px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-slate-200">Evidence Cards <span id="cardCount" class="font-mono text-slate-500"></span> <span id="gateCount" role="button" tabindex="0" title="Show findings waiting for a human decision" class="hidden ml-1 rounded px-1.5 py-0.5 text-[10px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-700/60"></span></button>
         <button data-tab="stream" class="tab px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-slate-200">Orchestrator Stream <span id="streamDot" class="inline-block w-1.5 h-1.5 rounded-full bg-slate-600 align-middle"></span></button>
         <button data-tab="chat" class="tab px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-slate-200">Ask Orchestrator</button>
+        <button data-tab="rem" class="tab px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-slate-200">Remediation Agent <span id="remDot" class="inline-block w-1.5 h-1.5 rounded-full bg-slate-600 align-middle"></span></button>
       </nav>
       <div id="tab-cards" class="tabpane flex-1 overflow-y-auto scroll-thin p-3 space-y-2">
         <div id="filterBar" class="hidden text-[11px] text-slate-400 flex items-center gap-2">Filtered by node <code id="filterNode" class="text-slate-200"></code><button id="clearFilter" class="underline">clear</button></div>
@@ -127,10 +128,23 @@
         <div id="fixGroups"></div>
         <div id="cards" class="space-y-2"><p class="text-xs text-slate-500">No cards yet.</p></div>
       </div>
+      <div id="tab-rem" class="tabpane hidden flex-1 overflow-y-auto scroll-thin p-3 space-y-3 text-xs">
+        <div class="rounded-md border border-ink-600 bg-ink-850 p-3 space-y-2">
+          <div class="text-[11px] text-slate-300">The agent investigates, changes an <b>isolated copy</b> of the repository with typed tools, and an independent validator re-scans after every iteration. Nothing touches the real repository until you approve individual changes below.</div>
+          <div class="flex flex-wrap items-center gap-3 text-[11px]">
+            <label class="flex items-center gap-1">iterations <select id="remIters" class="bg-ink-850 border border-ink-600 rounded px-1 py-0.5"><option>1</option><option>2</option><option>3</option><option>4</option><option selected>5</option><option>6</option><option>7</option><option>8</option></select></label>
+            <label class="flex items-center gap-1" title="Runs the project's own tests inside a Docker container with no network"><input id="remTests" type="checkbox" class="accent-sky-500">sandboxed tests (Docker)</label>
+            <label class="flex items-center gap-1"><input id="remLlm" type="checkbox" class="accent-sky-500" checked>use Gemini (else deterministic policy)</label>
+            <button id="remStart" class="rounded px-2.5 py-1 font-semibold bg-sky-600 hover:bg-sky-500 text-white">Run agent on top findings</button>
+            <button id="remStop" class="hidden rounded px-2.5 py-1 font-semibold bg-red-700 hover:bg-red-600 text-white">Stop</button>
+          </div>
+        </div>
+        <div id="remBody"><p class="text-slate-500">No remediation session yet. Run a scan, then start the agent here or from a card ("Fix in sandbox").</p></div>
+      </div>
       <div id="tab-stream" class="tabpane hidden flex-1 overflow-y-auto scroll-thin p-2 font-mono text-[11px] leading-5" ></div>
       <div id="tab-chat" class="tabpane hidden flex-1 flex flex-col overflow-hidden">
         <div id="chatLog" class="flex-1 overflow-y-auto scroll-thin p-3 space-y-3 text-xs">
-          <div class="text-slate-500">Ask about a finding (<code>F-001</code>), a package (<code>jsonwebtoken</code>), "what is noise?", or "how is the Elo computed?". Answers cite only verified evidence.</div>
+          <div class="text-slate-500">Ask about a finding (<code>F-001</code>), a package (<code>jsonwebtoken</code>), "what is noise?", or "how is the risk computed?". Answers cite only verified evidence.</div>
         </div>
         <form id="chatForm" class="border-t border-ink-700 p-2 flex gap-2">
           <input id="chatInput" maxlength="2000" class="flex-1 bg-ink-850 border border-ink-600 rounded px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-red-500" placeholder="Why is F-001 critical?">
@@ -187,12 +201,13 @@ function renderResult(res) {
   if (!res || !res.kpis) return;
   state.result = res; state.view = "repo";
   state.findings = Object.fromEntries((res.findings || []).map((f) => [f.id, f]));
-  renderFixGroups(res.fix_groups || []); renderDepStats(res.dependency_stats);
+  renderFixGroups(res.fix_groups || []); renderDepStats(res.dependency_stats); updateGateCount();
   $("#kTotal").textContent = res.kpis.total_components;
   $("#kRaw").textContent = res.kpis.raw_scanner_alerts;
   $("#kCrit").textContent = res.kpis.actionable_critical;
   $("#kNoise").textContent = res.kpis.downgraded_noise;
-  $("#kSrc").textContent = `sbom=${res.sbom_source} · advisories=${res.vuln_source}`;
+  const it0 = res.intel || {};
+  $("#kSrc").textContent = `sbom=${res.sbom_source} · advisories=${res.vuln_source}` + (it0.kev_checked !== undefined ? ` · KEV ${it0.kev_checked ? it0.kev_version : "n/a"} · EPSS ${it0.epss_checked ? (it0.epss_date || "ok") : "n/a"}` : "");
   const notes = $("#notes"); notes.querySelectorAll(".scan-note").forEach((n) => n.remove());
   (res.notes || []).forEach((n) => {
     const el = document.createElement("div");
@@ -268,7 +283,7 @@ function renderGraph(graph, kind = "attack") {
       else if ((n.tier === "DIRECT_PKG" || n.tier === "TRANSITIVE_PKG") && sev) color = n.severity === "LOW" ? "#10b981" : sev.node;
       if (a.public) { border = "#f43f5e"; bw = 3; }
     }
-    const badge = n.risk_elo != null ? `\n⟨Elo ${n.risk_elo}⟩` : "";
+    const badge = n.risk_score != null ? `\n⟨risk ${n.risk_score}⟩` : "";
     const showLabel = !deps || !crowded || a.root || n.tier === "DIRECT_PKG" || sev;
     els.push({ data: { id: n.id, label: showLabel ? n.label + badge : "", color, shape, size, tier: n.tier, raw: n, border, bw, bstyle } });
   });
@@ -315,7 +330,7 @@ function focusNode(node) {
        <div>depends on ${esc(a.dependencies)} · used by ${esc(a.dependents)}${(n.finding_ids || []).length ? ` · <span class="text-red-300">${n.finding_ids.length} finding(s)</span>` : " · no findings"}</div>
        ${(a.occurrences || []).length ? `<div class="text-slate-500">seen at ${a.occurrences.map(esc).join(", ")}</div>` : ""}`;
   }
-  info.innerHTML = `<div class="text-slate-100">${esc(n.label.replace(/\n/g, " "))}</div><div class="text-slate-500">${esc(n.tier)}${n.file ? " · " + esc(n.file) + (n.line ? ":" + esc(n.line) : "") : ""}${n.risk_elo != null ? " · Elo " + esc(n.risk_elo) : ""}</div>${pub}${depInfo}`;
+  info.innerHTML = `<div class="text-slate-100">${esc(n.label.replace(/\n/g, " "))}</div><div class="text-slate-500">${esc(n.tier)}${n.file ? " · " + esc(n.file) + (n.line ? ":" + esc(n.line) : "") : ""}${n.risk_score != null ? " · risk " + esc(n.risk_score) + "/100" : ""}</div>${pub}${depInfo}`;
   state.filter = { id: n.id, findings: new Set(n.finding_ids || []) };
   $("#filterBar").classList.remove("hidden"); $("#filterNode").textContent = n.id;
   renderCards(); showTab("cards");
@@ -420,8 +435,8 @@ function drawDepTree(scrollTo) {
       ${sev ? `<circle cx="${x}" cy="${yy}" r="10" fill="${color}" opacity="0.2"/>` : ""}
       <circle cx="${x}" cy="${yy}" r="${sev || hasKids ? 6 : 4}" fill="${sev || (hasKids && !open) ? color : "#0b0f16"}" stroke="${color}" stroke-width="2" style="cursor:${hasKids ? "pointer" : "default"}"/>
       ${isHl ? `<rect x="${x + 9}" y="${yy - 9}" width="${short.length * 7 + 26}" height="18" rx="4" fill="#fde68a" opacity="0.14"/>` : ""}
-      <text x="${x + 12}" y="${yy + 4}" data-label="${esc(n.id)}" fill="${isRoot ? "#7dd3fc" : "#e2e8f0"}" font-weight="${isRoot || meta.tier === "DIRECT_PKG" ? 600 : 400}">${tag}${esc(short)}${n.cycle ? " ↺" : ""}${hasKids && !open ? ` <tspan fill="#64748b">(+${n.total})</tspan>` : ""}${sev ? ` <tspan fill="${color}" font-weight="700">⚠ ${(meta.finding_ids || []).length} · Elo ${esc(meta.risk_elo)}</tspan>` : ""}${!open && below ? ` <tspan fill="${sevColor(below.worst)}">▸ ${below.n} below</tspan>` : ""}</text>
-      <title>${esc(lab)}${sev ? `\n${(meta.finding_ids || []).length} finding(s), worst ${sev} (Elo ${meta.risk_elo})` : ""}${isRoot ? "" : meta.tier === "DIRECT_PKG" ? (a.direct_inferred ? "\nno parent recorded: attached to the project (inferred direct)" : `\nDIRECT dependency${a.declared_spec ? " declared as " + a.declared_spec : ""}`) : `\nTRANSITIVE, depth ${meta.depth}`}</title></g>`;
+      <text x="${x + 12}" y="${yy + 4}" data-label="${esc(n.id)}" fill="${isRoot ? "#7dd3fc" : "#e2e8f0"}" font-weight="${isRoot || meta.tier === "DIRECT_PKG" ? 600 : 400}">${tag}${esc(short)}${n.cycle ? " ↺" : ""}${hasKids && !open ? ` <tspan fill="#64748b">(+${n.total})</tspan>` : ""}${sev ? ` <tspan fill="${color}" font-weight="700">⚠ ${(meta.finding_ids || []).length} · risk ${esc(meta.risk_score)}</tspan>` : ""}${!open && below ? ` <tspan fill="${sevColor(below.worst)}">▸ ${below.n} below</tspan>` : ""}</text>
+      <title>${esc(lab)}${sev ? `\n${(meta.finding_ids || []).length} finding(s), worst ${sev} (risk ${meta.risk_score}/100)` : ""}${isRoot ? "" : meta.tier === "DIRECT_PKG" ? (a.direct_inferred ? "\nno parent recorded: attached to the project (inferred direct)" : `\nDIRECT dependency${a.declared_spec ? " declared as " + a.declared_spec : ""}`) : `\nTRANSITIVE, depth ${meta.depth}`}</title></g>`;
   })(tree);
   const box = $("#depTree"), keep = [box.scrollTop, box.scrollLeft];
   box.innerHTML = `<svg width="${W}" height="${H}">${edges}${nodes}</svg>`;
@@ -484,7 +499,7 @@ function renderFixGroups(groups) {
   state.fixGroups = groups;
   if (!groups.length) { $("#fixGroups").innerHTML = ""; return; }
   const rows = groups.slice(0, 8).map((g) => { const s = SEV[g.max_severity] || SEV.LOW; return `<div class="fixgroup cursor-pointer rounded border border-ink-700 hover:border-ink-600 bg-ink-850 px-2 py-1.5" data-gid="${esc(g.id)}">
-      <div class="flex items-start gap-2"><span class="font-mono text-[10px] text-slate-500 mt-0.5">${esc(g.id)}</span><span class="text-[10px] font-semibold px-1.5 py-0.5 rounded ${s.bg} ${s.text}">${esc(g.max_severity)} ${esc(g.max_elo)}</span>
+      <div class="flex items-start gap-2"><span class="font-mono text-[10px] text-slate-500 mt-0.5">${esc(g.id)}</span><span class="text-[10px] font-semibold px-1.5 py-0.5 rounded ${s.bg} ${s.text}">${esc(g.max_severity)} ${esc(g.max_score)}</span>
       <span class="flex-1 text-[11px] text-slate-200">${esc(g.action)}</span><span class="text-[10px] text-slate-500 whitespace-nowrap">${g.findings.length} finding${g.findings.length > 1 ? "s" : ""}</span></div>
       <div class="mt-1 flex items-stretch gap-1"><code class="flex-1 rounded bg-ink-950 border border-ink-700 px-2 py-0.5 font-mono text-[10.5px] text-emerald-300 break-all">${esc(g.command)}</code><button class="copy rounded border border-ink-600 bg-ink-700 hover:bg-ink-600 px-2 text-[10px]" data-copy="${esc(g.command)}">copy</button></div>
       <div class="mt-0.5 text-[10px] text-slate-500 font-mono">${esc(FIX_KIND[g.kind] || g.kind)} · ${g.packages.slice(0, 4).map(esc).join(", ")}${g.packages.length > 4 ? ` +${g.packages.length - 4}` : ""}${g.runtime ? "" : " · dev/test only"}</div></div>`; }).join("");
@@ -520,15 +535,21 @@ function cardHtml(c, open) {
   const s = SEV[c.finding.severity] || SEV.LOW;
   const v = c.validation || {};
   const checks = Object.entries(v.checks || {}).map(([k, ok]) => `<span class="${ok ? "text-emerald-400" : "text-red-400"}">${ok ? "✓" : "✗"} ${esc(k)}</span>`).join(" ");
-  const deltas = (c.risk.deltas || []).map((d) => `<tr><td class="pr-3 text-right font-mono ${d.value >= 0 ? "text-red-300" : "text-emerald-300"}">${d.value >= 0 ? "+" : ""}${esc(d.value)}</td><td>${esc(d.label)}</td></tr>`).join("");
+  const r = c.risk;
+  const comps = (r.components || []).map((x) => `<tr><td class="pr-2 text-right font-mono text-slate-200 whitespace-nowrap">${esc(x.points)}${x.max_points ? `<span class="text-slate-500">/${esc(x.max_points)}</span>` : ""}</td><td class="pr-2 whitespace-nowrap text-slate-300">${esc(x.factor)}</td><td class="text-slate-400">${esc(x.detail)}</td></tr>`).join("");
+  const adjs = (r.adjustments || []).map((a) => `<tr><td class="pr-2 text-right font-mono text-amber-300 whitespace-nowrap">${esc(a.effect)}</td><td colspan="2" class="text-amber-200/80">${esc(a.label)}</td></tr>`).join("");
+  const confPct = Math.round((r.confidence || 0) * 100);
+  const confCol = r.confidence_level === "high" ? "bg-emerald-500" : r.confidence_level === "medium" ? "bg-amber-500" : "bg-red-500";
+  const srcs = ((r.factors || {}).sources || []).map((x) => `<li><span class="text-slate-300">${esc(x.name)}</span>: ${esc(x.value)}${x.as_of ? ` <span class="text-slate-500">(as of ${esc(x.as_of)})</span>` : ""}${x.url ? ` <a class="underline text-sky-400" href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">source</a>` : ""}</li>`).join("");
   const hops = (c.attack_path.hops || []).map((h) => `<li class="font-mono text-[10.5px] text-slate-300 break-all">${esc(h)}</li>`).join("");
   const refs = (c.remediation.references || []).map((r) => /^https?:\/\//.test(r) ? `<a class="underline text-sky-400 break-all" href="${esc(r)}" target="_blank" rel="noopener noreferrer">${esc(r)}</a>` : esc(r)).join("<br>");
   return `<details class="rounded-md border ${s.border} bg-ink-850" ${open ? "open" : ""}>
     <summary class="px-3 py-2 flex items-start gap-2">
       <span class="font-mono text-[10px] mt-0.5 text-slate-500">${esc(c.finding.finding_id)}</span>
       <span class="text-[10px] font-semibold px-1.5 py-0.5 rounded ${s.bg} ${s.text}">${esc(c.finding.severity)}</span>
-      <span class="font-mono text-[11px] ${s.text}">Elo ${esc(c.risk.total)}</span>
+      <span class="font-mono text-[11px] ${s.text}">${esc(c.risk.total)}/100</span><span class="text-[10px] font-mono text-slate-400 whitespace-nowrap">${esc(c.risk.priority.split(" ")[0])} · conf ${esc(c.risk.confidence_level)}</span>
       <span class="text-xs text-slate-200 flex-1">${esc(c.finding.title)}</span>
+      <span id="gate-${esc(c.finding.finding_id)}">${gateBadge(c.finding.finding_id)}</span>
       <span class="text-[10px] ${v.passed ? "text-emerald-400" : "text-red-400"}" title="Post-Check Validator">${v.passed ? "✓ verified" : "✗ unverified"}</span>
     </summary>
     <div class="px-3 pb-3 space-y-3 text-xs">
@@ -539,19 +560,245 @@ function cardHtml(c, open) {
         <pre class="mt-1 rounded bg-ink-950 border border-ink-700 p-2 overflow-x-auto scroll-thin text-[10.5px] leading-4"><code class="hljs">${highlighted(c.location.code_snippet || "", c.location.local_file)}</code></pre></div>
       <div><div class="text-[10px] uppercase tracking-widest text-slate-500">3 · Attack path <span class="normal-case text-slate-400">(call-chain depth ${esc(c.attack_path.call_chain_depth ?? "n/a")})</span></div>
         <ol class="mt-1 space-y-0.5 list-decimal list-inside">${hops || '<li class="text-slate-500">direct leaf</li>'}</ol></div>
-      <div><div class="text-[10px] uppercase tracking-widest text-slate-500">4 · Risk Elo (locked formula)</div>
-        <table class="mt-1 text-[11px]"><tr><td class="pr-3 text-right font-mono text-slate-200">${esc(c.risk.base)}</td><td>base: ${esc(c.risk.base_reason)}</td></tr>${deltas}
-        <tr class="border-t border-ink-600"><td class="pr-3 text-right font-mono font-semibold ${s.text}">${esc(c.risk.total)}</td><td class="font-semibold ${s.text}">${esc(c.risk.severity)}</td></tr></table></div>
+      <div><div class="text-[10px] uppercase tracking-widest text-slate-500">4 · Risk score (deterministic engine ${esc(r.formula_version)}) · <span class="normal-case">${esc(r.priority)}</span></div>
+        <table class="mt-1 text-[11px] w-full">${comps}${adjs}
+        <tr class="border-t border-ink-600"><td class="pr-2 text-right font-mono font-semibold ${s.text}">${esc(r.total)}<span class="text-slate-500">/100</span></td><td colspan="2" class="font-semibold ${s.text}">${esc(r.severity)} <span class="font-normal text-slate-500">(Critical &ge; 80 · High &ge; 60 · Medium &ge; 30)</span></td></tr></table>
+        <div class="mt-2 flex items-center gap-2 text-[11px]"><span class="text-slate-400">Confidence</span><div class="w-24 h-1.5 rounded bg-ink-700 overflow-hidden"><div class="h-full ${confCol}" style="width:${confPct}%"></div></div><span class="font-mono text-slate-300">${esc(r.confidence_level)} ${esc(r.confidence)}</span></div>
+        ${(r.confidence_reasons || []).length ? `<ul class="mt-0.5 text-[10.5px] text-slate-500 font-mono">${r.confidence_reasons.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
+        ${srcs ? `<details class="mt-1"><summary class="text-[10.5px] text-sky-400">evidence sources (${r.factors.sources.length})</summary><ul class="mt-1 space-y-0.5 text-[10.5px] text-slate-400 break-all">${srcs}</ul></details>` : ""}</div>
       <div><div class="text-[10px] uppercase tracking-widest text-slate-500">5 · Remediation${c.remediation.fix_group ? ` <span class="normal-case font-mono text-emerald-400">${esc(c.remediation.fix_group)}</span>` : ""}</div>
         <div class="text-slate-300">${esc(c.remediation.summary)}</div>
         ${rootCauseHtml(c)}
+        ${state.view !== "sim" ? `<button class="rem-one mt-1 rounded border border-sky-800 px-2 py-0.5 text-[10px] text-sky-300 hover:bg-sky-950/40" data-fid="${esc(c.finding.finding_id)}">Fix in sandbox (agent)</button>` : ""}
         <div class="mt-1 flex items-stretch gap-1"><code class="flex-1 rounded bg-ink-950 border border-ink-700 px-2 py-1 font-mono text-[11px] text-emerald-300 break-all">${esc(c.remediation.fix_command)}</code>
         <button class="copy rounded border border-ink-600 bg-ink-700 hover:bg-ink-600 px-2 text-[10px]" data-copy="${esc(c.remediation.fix_command)}">copy</button></div>
         ${refs ? `<div class="mt-1 text-[10px]">${refs}</div>` : ""}</div>
+      ${mitigationPanelHtml(c.finding.finding_id)}
       <div class="text-slate-400 italic">${esc(c.narrative)}</div>
       <div class="text-[10px] flex flex-wrap gap-x-2 gap-y-0.5 border-t border-ink-700 pt-2"><span class="text-slate-500">validator (${esc(c.author)}${v.fell_back_to_deterministic ? ", fallback" : ""}${v.retries ? ", retries " + esc(v.retries) : ""}):</span> ${checks}</div>
     </div></details>`;
 }
+// ---------- Mitigation & Human Validation panel ----------
+const DECISION_STYLE = { PENDING: "bg-slate-500/20 text-slate-300", APPROVED: "bg-emerald-500/15 text-emerald-300",
+  ACCEPTED_RISK: "bg-amber-500/15 text-amber-300", REJECTED_ESCALATED: "bg-red-500/15 text-red-300" };
+const COMPAT_STYLE = { LOW: "bg-emerald-500/15 text-emerald-300", MEDIUM: "bg-amber-500/15 text-amber-300", HIGH: "bg-red-500/15 text-red-300" };
+const mitOf = (fid) => (state.view !== "sim" && state.result && state.result.mitigations) ? state.result.mitigations[fid] : null;
+function gateBadge(fid) {
+  const m = mitOf(fid); if (!m) return "";
+  const d = m.human_validation.decision;
+  if (m.requires_human_validation && d === "PENDING") return '<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 whitespace-nowrap">⚑ needs review</span>';
+  return `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded whitespace-nowrap ${DECISION_STYLE[d]}">${esc(d === "APPROVED" && !m.requires_human_validation ? "auto-approved" : d.toLowerCase().replace("_", " "))}</span>`;
+}
+function readReviewer() { try { return localStorage.getItem("scg-reviewer") || ""; } catch (e) { return ""; } }
+function mitigationPanelHtml(fid) {
+  const m = mitOf(fid); if (!m) return "";
+  const hv = m.human_validation, gated = m.requires_human_validation;
+  const selected = hv.chosen_candidate_id || m.recommended_candidate_id;
+  const header = gated
+    ? '<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-700/60">Human Validation Required</span>'
+    : '<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-800">Python Auto-Approved (Safe Patch)</span>';
+  const reasons = gated && m.escalation_reasons.length ? `<ul class="mt-1 list-disc list-inside text-[11px] text-amber-200/90">${m.escalation_reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>` : "";
+  const cands = m.candidates.map((c) => {
+    const rec = c.candidate_id === m.recommended_candidate_id;
+    const brk = c.breaking_changes.length ? `<div class="mt-1 text-[10.5px] text-red-300">${c.affects_called_symbols.length ? `<b>affects your code (${c.affects_called_symbols.map(esc).join(", ")}):</b> ` : "breaking notes: "}${c.breaking_changes.slice(0, 3).map(esc).join(" · ")}</div>` : "";
+    const cmd = (label, v) => `<div class="mt-1 flex items-stretch gap-1"><span class="w-14 shrink-0 text-[10px] text-slate-500 pt-1">${label}</span><code class="flex-1 rounded bg-ink-950 border border-ink-700 px-2 py-0.5 font-mono text-[10.5px] ${label === "apply" ? "text-emerald-300" : "text-slate-300"} break-all">${esc(v)}</code><button class="copy rounded border border-ink-600 bg-ink-700 hover:bg-ink-600 px-2 text-[10px]" data-copy="${esc(v)}">copy</button></div>`;
+    return `<label class="block rounded border ${rec ? "border-sky-800" : "border-ink-700"} bg-ink-950/40 p-2 cursor-pointer hover:border-ink-600">
+      <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <input type="radio" class="accent-sky-500" name="mit-${esc(fid)}" value="${esc(c.candidate_id)}" ${c.candidate_id === selected ? "checked" : ""}>
+        <span class="font-mono text-[10px] text-slate-500">${esc(c.candidate_id)}${rec ? " ★" : ""}</span>
+        <span class="text-[10px] font-mono px-1 rounded bg-ink-700 text-slate-300">${esc(c.source)}${c.also_reported_by.length ? " + " + c.also_reported_by.map(esc).join(", ") : ""}</span>
+        <span class="text-[11px] text-slate-200">${esc(c.action_type.replace(/_/g, " ").toLowerCase())}</span>
+        <span class="font-mono text-[11px] text-slate-100 break-all">${esc(c.target_version_or_ref)}</span>
+        <span class="text-[10px] font-mono text-slate-400">${esc(c.semver_jump)}</span>
+        <span class="text-[10px] font-mono px-1.5 rounded ${COMPAT_STYLE[c.compatibility_risk]}">${esc(c.compatibility_risk)} compat</span>
+        <span class="ml-auto font-mono text-[11px] text-slate-200" title="${esc(c.fit_breakdown.join(" · "))}">fit ${esc(c.fit_score)}</span>
+      </div>
+      ${brk}
+      ${c.version_diff_notes ? `<div class="mt-1 text-[10.5px] text-slate-500">${esc(c.version_diff_notes)}</div>` : ""}
+      ${cmd("apply", c.apply_command)}${cmd("rollback", c.rollback_command)}
+    </label>`;
+  }).join("");
+  const decided = hv.decision !== "PENDING" ? `<div class="text-[11px] text-slate-300"><span class="font-mono px-1.5 py-0.5 rounded ${DECISION_STYLE[hv.decision]}">${esc(hv.decision)}</span>
+      by <b>${esc(hv.reviewer || "?")}</b> at <span class="font-mono">${esc(hv.decided_at || "")}</span>${hv.chosen_candidate_id ? ` · chose <span class="font-mono">${esc(hv.chosen_candidate_id)}</span>` : ""}${hv.justification ? `<div class="text-slate-400 mt-0.5">“${esc(hv.justification)}”</div>` : ""}</div>` : "";
+  return `<div id="mit-${esc(fid)}" class="rounded border ${gated ? "border-amber-800/70" : "border-emerald-900/70"} p-2 space-y-2">
+    <div class="flex flex-wrap items-center gap-2"><span class="text-[10px] uppercase tracking-widest text-slate-500">6 · Mitigation &amp; human validation</span>${header}
+      <span class="text-[10px] font-mono px-1.5 py-0.5 rounded ${DECISION_STYLE[hv.decision]}">${esc(hv.decision)}</span>
+      <span class="text-[10px] text-slate-500">${m.is_production ? "production dependency" : "dev/test only"} · risk ${esc(m.risk_score)}/100</span></div>
+    ${reasons}
+    <div class="text-[11px] text-slate-300"><span class="text-[10px] font-mono text-slate-500">${m.summary_author === "llm" ? "AI trade-off summary · validated against the candidates" : "trade-off summary · deterministic"}</span><div>${esc(m.ai_tradeoff_summary)}</div></div>
+    <div class="space-y-1.5" role="radiogroup" aria-label="Mitigation candidates">${cands}</div>
+    ${decided}
+    <div class="grid gap-1.5">
+      <div class="flex flex-wrap gap-1.5">
+        <input id="mit-rev-${esc(fid)}" maxlength="80" placeholder="reviewer name" value="${esc(readReviewer())}" class="w-40 bg-ink-850 border border-ink-600 rounded px-2 py-1 text-[11px] text-slate-200 focus:outline-none focus:border-sky-500">
+        <input id="mit-why-${esc(fid)}" maxlength="2000" placeholder="justification (required to accept risk)" class="flex-1 min-w-[180px] bg-ink-850 border border-ink-600 rounded px-2 py-1 text-[11px] text-slate-200 focus:outline-none focus:border-sky-500">
+      </div>
+      <div class="flex flex-wrap gap-1.5">
+        <button data-mit-act="APPROVED" data-fid="${esc(fid)}" class="rounded px-2.5 py-1 text-[11px] font-semibold bg-emerald-600 hover:bg-emerald-500 text-white">Approve Selected Fix</button>
+        <button data-mit-act="ACCEPTED_RISK" data-fid="${esc(fid)}" class="rounded px-2.5 py-1 text-[11px] font-semibold bg-amber-600 hover:bg-amber-500 text-ink-950">Accept Risk</button>
+        <button data-mit-act="REJECTED_ESCALATED" data-fid="${esc(fid)}" class="rounded px-2.5 py-1 text-[11px] font-semibold bg-red-700 hover:bg-red-600 text-white">Reject &amp; Escalate</button>
+        <span id="mit-msg-${esc(fid)}" class="text-[11px] self-center" role="status"></span>
+      </div>
+      <div class="text-[10px] text-slate-500">Approving records the decision in the audit log. The Guardian never runs the command; apply it in a branch and rescan.</div>
+    </div>
+  </div>`;
+}
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-mit-act]"); if (!b) return;
+  e.preventDefault();
+  const fid = b.dataset.fid, decision = b.dataset.mitAct;
+  const panel = document.getElementById("mit-" + fid);
+  const chosen = panel.querySelector(`input[name="mit-${CSS.escape(fid)}"]:checked`);
+  const reviewer = document.getElementById("mit-rev-" + fid).value.trim();
+  const justification = document.getElementById("mit-why-" + fid).value.trim();
+  const msg = document.getElementById("mit-msg-" + fid);
+  try { localStorage.setItem("scg-reviewer", reviewer); } catch (err) { /* storage unavailable */ }
+  msg.className = "text-[11px] self-center text-slate-400"; msg.textContent = "saving…";
+  try {
+    const pkg = await api("/api/mitigations/validate", { finding_id: fid, decision, reviewer, justification,
+      chosen_candidate_id: decision === "APPROVED" && chosen ? chosen.value : null });
+    state.result.mitigations[fid] = pkg;
+    panel.outerHTML = mitigationPanelHtml(fid);
+    const g = document.getElementById("gate-" + fid); if (g) g.innerHTML = gateBadge(fid);
+    updateGateCount();
+    const m2 = document.getElementById("mit-msg-" + fid);
+    if (m2) { m2.className = "text-[11px] self-center text-emerald-300"; m2.textContent = `recorded: ${pkg.human_validation.decision}`; }
+  } catch (err) { msg.className = "text-[11px] self-center text-red-300"; msg.textContent = err.message; }
+});
+function pendingGated() {
+  const ms = (state.result && state.result.mitigations) || {};
+  return Object.values(ms).filter((m) => m.requires_human_validation && m.human_validation.decision === "PENDING");
+}
+function updateGateCount() {
+  const n = state.view === "sim" ? 0 : pendingGated().length;
+  const el = $("#gateCount"); el.textContent = `⚑ ${n} to review`; el.classList.toggle("hidden", !n);
+}
+function filterToGated(e) {
+  if (e) { e.stopPropagation(); e.preventDefault(); }
+  state.filter = { id: "review", findings: new Set(pendingGated().map((m) => m.finding_id)) };
+  $("#filterBar").classList.remove("hidden"); $("#filterNode").textContent = "waiting for human validation"; renderCards(); showTab("cards");
+}
+$("#gateCount").addEventListener("click", filterToGated);
+$("#gateCount").addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") filterToGated(e); });
+
+// ---------- Remediation agent ----------
+const REM_STATUS = { resolved: "bg-emerald-500/15 text-emerald-300", unresolved: "bg-slate-500/20 text-slate-300",
+  accepted_risk: "bg-amber-500/15 text-amber-300", dismissed: "bg-slate-500/20 text-slate-400", requires_human_review: "bg-amber-500/15 text-amber-300" };
+const VERDICT = { improved: "text-emerald-300", no_change: "text-slate-300", regressed: "text-red-300", error: "text-red-300", baseline: "text-slate-400" };
+state.remAccepted = null; state.remOpen = new Set(); state.remSig = ""; state.remPrepared = null; let remTimer = null;
+function diffHtml(d) {
+  return `<pre class="mt-1 rounded bg-ink-950 border border-ink-700 p-2 overflow-x-auto scroll-thin text-[10.5px] leading-4 max-h-72">${esc(d).split("\n").map((l) =>
+    l.startsWith("+") && !l.startsWith("+++") ? `<span class="text-emerald-300">${l}</span>` : l.startsWith("-") && !l.startsWith("---") ? `<span class="text-red-300">${l}</span>` :
+    l.startsWith("@@") ? `<span class="text-sky-400">${l}</span>` : l).join("\n")}</pre>`;
+}
+function remDetails(id, summary, body) {
+  return `<details data-remopen="${esc(id)}" class="rounded border border-ink-700 bg-ink-850" ${state.remOpen.has(id) ? "open" : ""}><summary class="px-2 py-1.5">${summary}</summary><div class="px-2 pb-2 space-y-1">${body}</div></details>`;
+}
+function renderRem(d) {
+  const m = d && d.session;
+  $("#remDot").className = `inline-block w-1.5 h-1.5 rounded-full align-middle ${d && d.running ? "bg-sky-400 animate-pulse" : m ? "bg-emerald-400" : "bg-slate-600"}`;
+  $("#remStop").classList.toggle("hidden", !(d && d.running)); $("#remStart").disabled = !!(d && d.running);
+  if (!m) return;
+  const sig = `${m.status}|${m.steps.length}|${m.changes.length}|${m.validations.length}|${m.approval.state || ""}|${m.changes.map((c) => c.status).join("")}`;
+  if (sig === state.remSig) return;
+  state.remSig = sig;
+  const applied = m.changes.filter((c) => c.status === "applied");
+  // default selection = every applied change, set once when the session has finished (the user can untick)
+  if (state.remAccepted === null || state.remAccepted.__session !== m.session_id || (!state.remAccepted.__ready && m.status === "finished")) {
+    state.remAccepted = new Set(m.status === "finished" ? applied.map((c) => c.change_id) : []);
+    state.remAccepted.__session = m.session_id; state.remAccepted.__ready = m.status === "finished";
+  }
+  const targets = m.targets.map((t) => `<tr class="border-t border-ink-700"><td class="py-1 pr-2 font-mono text-[10.5px] break-all">${esc(t.key)}</td><td class="pr-2">${esc(t.severity)} ${esc(t.score)}</td>
+    <td class="pr-2"><span class="font-mono text-[10px] px-1.5 py-0.5 rounded ${REM_STATUS[t.status]}">${esc(t.status.replace(/_/g, " "))}</span>${t.resolved_in_candidate ? ' <span class="text-[10px] text-emerald-300">fixed in candidate</span>' : ""}</td>
+    <td class="text-slate-400">${esc(t.reason)}</td></tr>`).join("");
+  const iters = [...new Set(m.steps.map((x) => x.iteration))].map((it) => {
+    const steps = m.steps.filter((x) => x.iteration === it).map((x) => `<div class="grid grid-cols-[48px_1fr] gap-2 border-t border-ink-700 pt-1">
+      <span class="font-mono text-[10px] ${x.actor === "llm" ? "text-fuchsia-300" : "text-slate-500"}">${esc(x.actor)}</span>
+      <div class="min-w-0">${x.thought ? `<div class="italic text-fuchsia-200/80">${esc(x.thought)}</div>` : ""}
+        <div><span class="font-mono ${x.ok ? "text-sky-300" : "text-red-300"}">${esc(x.tool)}</span> <span class="font-mono text-[10px] text-slate-500 break-all">${esc(JSON.stringify(x.args).slice(0, 220))}</span></div>
+        <div class="font-mono text-[10px] text-slate-400 break-all">${esc(x.observation.slice(0, 400))}</div></div></div>`).join("");
+    const v = m.validations.filter((x) => x.iteration === it).slice(-1)[0];
+    const vhtml = v ? `<div class="mt-1 rounded bg-ink-950/60 border border-ink-700 p-1.5 text-[11px]"><b class="${VERDICT[v.verdict]}">validator: ${esc(v.verdict)}</b> · max risk ${esc(v.risk.max)} · total ${esc(v.risk.total)} · resolved vs baseline ${v.resolved_vs_baseline.length} · new ${v.new_vs_baseline.length}
+      · graph ${v.graph_consistency.ok ? "consistent" : "INCONSISTENT"} · tests ${esc(v.tests.status)}${(v.notes || []).length ? `<div class="text-amber-300">${v.notes.map(esc).join("; ")}</div>` : ""}
+      <div class="text-slate-500">${v.changes_verified.map((c) => `${esc(c.change_id)} ${c.ok ? "✓" : "✗ " + esc(c.detail)}`).join(" · ")}</div></div>` : "";
+    const plans = m.plans.filter((p) => p.iteration === it).map((p) => `<div class="text-[11px]"><b>plan:</b> ${esc(p.strategy)} — ${esc(p.rationale)}${p.alternatives_considered.length ? `<div class="text-slate-500">alternatives: ${p.alternatives_considered.map(esc).join("; ")}</div>` : ""}</div>`).join("");
+    return remDetails(`it${it}`, `<b>Iteration ${it}</b> <span class="text-slate-500">${m.steps.filter((x) => x.iteration === it).length} tool calls</span> ${v ? `<span class="${VERDICT[v.verdict]}">· ${esc(v.verdict)}</span>` : ""}`, plans + steps + vhtml);
+  }).join("");
+  const changes = m.changes.map((c) => {
+    const on = c.status === "applied";
+    return remDetails(c.change_id, `<label class="inline-flex items-center gap-2" onclick="event.stopPropagation()"><input type="checkbox" class="rem-accept accent-emerald-500" data-cid="${esc(c.change_id)}" ${on && state.remAccepted.has(c.change_id) ? "checked" : ""} ${on && !d.running && m.status === "finished" ? "" : "disabled"}></label>
+      <b class="font-mono">${esc(c.change_id)}</b> ${esc(c.tool)} <span class="text-[10px] px-1 rounded ${c.impact === "high" ? "bg-amber-500/15 text-amber-300" : "bg-emerald-500/15 text-emerald-300"}">${esc(c.impact)} impact</span>
+      ${on ? "" : `<span class="text-[10px] text-red-300">${esc(c.status)}</span>`} <span class="text-slate-400">${esc(c.reason.slice(0, 120))}</span>`,
+      `${c.impact_reasons.length ? `<div class="text-amber-300 text-[11px]">${c.impact_reasons.map(esc).join("; ")}</div>` : ""}
+       <div class="text-[10px] text-slate-500">findings: ${c.finding_ids.map(esc).join(", ") || "—"}</div>${c.files.map((f) => diffHtml(f.diff)).join("")}`);
+  }).join("") || '<p class="text-slate-500">No candidate changes.</p>';
+  const risk = m.risk_history.map((r) => `it${r.iteration}: max ${r.max} / total ${r.total}`).join(" → ");
+  const fv = m.final_validation;
+  $("#remBody").innerHTML = `
+    <div class="rounded-md border ${m.status === "error" ? "border-red-800" : "border-ink-600"} bg-ink-850 p-3 space-y-1">
+      <div class="flex flex-wrap gap-2 items-center"><b class="text-slate-100">Session ${esc(m.session_id)}</b><span class="font-mono text-[10px] px-1.5 rounded bg-ink-700">${esc(m.status)}</span>
+        <span class="text-slate-400">driver ${esc(m.driver)} · iteration ${esc(m.iteration)}/${esc(m.max_iterations)} · tests ${m.run_tests ? "sandboxed" : "off"}</span></div>
+      ${m.summary ? `<div class="text-slate-200">${esc(m.summary)}</div>` : '<div class="text-slate-400">working… (live log in the Orchestrator Stream tab)</div>'}
+      ${m.stop_reason ? `<div class="text-[11px] text-slate-400">stop reason: ${esc(m.stop_reason)}</div>` : ""}
+      ${m.agent_stated_reason ? `<div class="text-[11px] text-fuchsia-200/80">agent's own words (not verified): ${esc(m.agent_stated_reason)}</div>` : ""}
+      <div class="text-[10.5px] font-mono text-slate-500">risk: ${esc(risk)}</div>
+      <div class="text-[10px] text-slate-500 break-all">audit log: ${esc(m.audit_log)}</div></div>
+    <div><div class="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Target findings (status from the independent validator)</div>
+      <div class="overflow-x-auto"><table class="w-full text-[11px]">${targets}</table></div></div>
+    <div class="space-y-1.5"><div class="text-[10px] uppercase tracking-widest text-slate-500">Iterations</div>${iters || '<p class="text-slate-500">baseline scan running…</p>'}</div>
+    <div class="space-y-1.5"><div class="text-[10px] uppercase tracking-widest text-slate-500">Candidate changes (tick the ones you approve)</div>${changes}</div>
+    ${m.status === "finished" && applied.length ? `<div class="rounded-md border border-emerald-900 bg-ink-850 p-2 space-y-2"><div class="text-[11px] text-slate-300">Approved changes are replayed on a fresh copy of the original and re-diffed. You confirm that exact diff before anything is written.</div>
+      <button id="remPrepare" class="rounded px-2.5 py-1 font-semibold bg-emerald-600 hover:bg-emerald-500 text-white">Prepare approved changes</button><div id="remPrepared"></div></div>` : ""}
+    ${fv ? `<div class="rounded-md border border-emerald-800 bg-emerald-950/20 p-2"><b class="text-emerald-300">Applied to the original repository</b>: ${esc((m.approval.written || []).join(", "))}
+      <div class="text-[11px] mt-1">final independent validation: <b class="${VERDICT[fv.verdict]}">${esc(fv.verdict)}</b> · max risk ${esc(fv.risk.max)} · resolved vs baseline ${fv.resolved_vs_baseline.length} · new ${fv.new_vs_baseline.length} · graph ${fv.graph_consistency.ok ? "consistent" : "INCONSISTENT"} · tests ${esc(fv.tests.status)}</div>
+      <div class="text-[10px] text-slate-500">Run a Full Scan to refresh the dashboard from the updated repository.</div></div>` : ""}`;
+  if (state.remPrepared) renderPrepared(state.remPrepared);
+}
+function renderPrepared(r) {
+  const el = document.getElementById("remPrepared"); if (!el) return;
+  el.innerHTML = `<div class="text-[11px] ${r.matches_reviewed_candidate ? "text-emerald-300" : "text-amber-300"}">${esc(r.note)}</div>
+    <div class="text-[10px] text-slate-500">lockfile: ${esc(r.lockfile.reason)} · files: ${r.files.map(esc).join(", ")} · digest <span class="font-mono">${esc(r.digest.slice(0, 16))}…</span></div>
+    ${Object.values(r.diff).map(diffHtml).join("")}
+    <button id="remConfirm" data-digest="${esc(r.digest)}" class="rounded px-2.5 py-1 font-semibold bg-red-700 hover:bg-red-600 text-white">Confirm: write these changes to the repository</button>`;
+}
+async function pollRem() {
+  try { const d = await api("/api/remediation/session"); renderRem(d); if (!d.running && remTimer) { clearInterval(remTimer); remTimer = null; } }
+  catch (e) { /* server busy */ }
+}
+async function startRem(ids) {
+  try {
+    state.remAccepted = null; state.remPrepared = null; state.remSig = ""; state.remOpen = new Set(["it1"]);
+    const d = await api("/api/remediation/start", { finding_ids: ids, max_iterations: +$("#remIters").value, run_tests: $("#remTests").checked, use_llm: $("#remLlm").checked });
+    showTab("rem"); renderRem(d);
+    if (remTimer) clearInterval(remTimer);
+    remTimer = setInterval(pollRem, 2000);
+  } catch (e) { toastNote("Remediation agent: " + e.message, "error"); }
+}
+$("#remStart").onclick = () => startRem([]);
+$("#remStop").onclick = async () => { try { renderRem(await api("/api/remediation/stop", {})); } catch (e) { toastNote(e.message, "error"); } };
+document.addEventListener("click", async (e) => {
+  const one = e.target.closest(".rem-one");
+  if (one) { e.preventDefault(); startRem([one.dataset.fid]); return; }
+  if (e.target.id === "remPrepare") {
+    const ids = [...document.querySelectorAll(".rem-accept:checked")].map((x) => x.dataset.cid);
+    try { state.remPrepared = await api("/api/remediation/prepare-apply", { accepted_change_ids: ids }); renderPrepared(state.remPrepared); }
+    catch (err) { toastNote("Prepare: " + err.message, "error"); }
+  }
+  if (e.target.id === "remConfirm") {
+    try { await api("/api/remediation/apply", { digest: e.target.dataset.digest, confirm: true }); state.remPrepared = null; state.remSig = ""; await pollRem(); }
+    catch (err) { toastNote("Apply: " + err.message, "error"); }
+  }
+});
+document.addEventListener("change", (e) => {
+  const cb = e.target.closest(".rem-accept"); if (!cb || !state.remAccepted) return;
+  cb.checked ? state.remAccepted.add(cb.dataset.cid) : state.remAccepted.delete(cb.dataset.cid);
+  state.remPrepared = null; const el = document.getElementById("remPrepared"); if (el) el.innerHTML = "";
+});
+document.addEventListener("toggle", (e) => {
+  const d = e.target.closest && e.target.closest("[data-remopen]"); if (!d || d !== e.target) return;
+  d.open ? state.remOpen.add(d.dataset.remopen) : state.remOpen.delete(d.dataset.remopen);
+}, true);
+
 function rootCauseHtml(c) {
   const r = c.remediation;
   if (!r.root_cause) return "";
@@ -593,7 +840,7 @@ function replayPanel(rep) {
 }
 function simPanel(sim) {
   return `<div class="rounded-md border ${sim.blocked ? "border-red-700 bg-red-950/40" : "border-amber-700 bg-amber-950/30"} p-3 text-xs">
-    <div class="text-sm font-bold ${sim.blocked ? "text-red-400" : "text-amber-300"}">${sim.blocked ? "ATTACK INTERCEPTED & BLOCKED" : "ATTACK NOT FULLY BLOCKED"} · max Elo ${esc(sim.max_elo)}</div>
+    <div class="text-sm font-bold ${sim.blocked ? "text-red-400" : "text-amber-300"}">${sim.blocked ? "ATTACK INTERCEPTED & BLOCKED" : "ATTACK NOT FULLY BLOCKED"} · max risk ${esc(sim.max_score)}/100</div>
     <ul class="mt-1 list-disc list-inside text-[11px] text-slate-300">${sim.injected.map((i) => `<li class="break-all">${esc(i)}</li>`).join("")}</ul>
     <div class="mt-2 text-[10px] text-slate-500">${sim.safety_notes.map(esc).join("<br>")}</div></div>`;
 }
@@ -607,7 +854,7 @@ document.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click
   if (act === "simulate") run("Simulating attack", async () => {
     const sim = await api("/api/simulate-attack", { repo: repo() });
     if (!state.result) { try { const r = await api("/api/result"); if (r.kpis) state.result = r; } catch (e) { /* ignore */ } }
-    state.view = "sim"; $("#fixGroups").innerHTML = ""; $("#depStats").classList.add("hidden");
+    state.view = "sim"; $("#fixGroups").innerHTML = ""; $("#depStats").classList.add("hidden"); updateGateCount();
     $("#cy").classList.remove("hidden"); $("#depTree").classList.add("hidden");
     renderGraph(sim.graph, "attack"); setCards(sim.cards); setExtra(simPanel(sim) + gatePanel(sim.admission));
     $("#viewToggle").classList.add("opacity-40", "pointer-events-none");
@@ -697,7 +944,9 @@ $("#chatForm").addEventListener("submit", async (e) => {
     $("#repo").value = cfg.default_repo;
     $("#llmBadge").textContent = cfg.llm_provider === "none" ? "LLM: off (deterministic)" : `LLM: ${cfg.llm_provider} · ${cfg.llm_model} · t=0.0`;
     if (cfg.offline) toastNote("offline mode: demo advisories, no registry lookups");
+    if (cfg.llm_error) { toastNote(cfg.llm_error, "error"); $("#llmBadge").textContent = "LLM: SDK missing"; $("#llmBadge").classList.add("text-red-400", "border-red-800"); }
     const r = await api("/api/result"); if (r && r.kpis) renderResult(r);
+    const rs = await api("/api/remediation/session"); if (rs && rs.session) { renderRem(rs); if (rs.running) remTimer = setInterval(pollRem, 2000); }
   } catch (e) { toastNote("server unreachable: " + e.message, "error"); }
 })();
 </script>

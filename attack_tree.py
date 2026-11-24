@@ -1,13 +1,14 @@
-"""Bounded, evidence-backed Attack Tree + deterministic Risk Elo engine.
+"""Bounded, evidence-backed Attack Tree; builds the inputs of the risk engine.
 
 Invariant: every edge in the graph carries an `Evidence` object pointing at a
 verifiable artifact (file:line, lockfile entry, registry metadata, Dockerfile
 line). The LLM layer may *read* this graph but can never add edges or change a
-score: `compute_risk_elo` is the single source of truth and the Post-Check
-Validator recomputes it for every card.
+score: `risk_engine.compute_risk` is the single source of truth and the
+Post-Check Validator recomputes it for every card.
 """
 from __future__ import annotations
 
+import os
 import posixpath
 import re
 from dataclasses import dataclass
@@ -22,9 +23,8 @@ from models import (
     AttackEdge,
     AttackNode,
     Component,
-    EloBreakdown,
-    EloDelta,
-    EloFactors,
+    IntelSource,
+    RiskFactors,
     Evidence,
     EvidenceKind,
     Finding,
@@ -41,55 +41,10 @@ from scanners import CURATED_SYMBOLS, ImportSite, LogFn, _noop_log, read_text
 from dep_graph import DependencyIndex, build_dependency_graph  # noqa: F401  (re-exported)
 from remediation import attach_fix_recommendations
 
-# --------------------------------------------------------------------------- #
-# Locked formula
-# --------------------------------------------------------------------------- #
-PRE_CVE_BASE = 1800
-HYGIENE_BASE = 1000
-DELTA_SYMBOL_CALLED = 350
-DELTA_AUTO_EXEC_HOOK = 500
-DELTA_SYMBOL_NOT_CALLED = -600
-DELTA_PUBLIC_ROUTE = 200
-DELTA_DEV_OR_TEST = -300
-DELTA_PROVENANCE = 400
+from risk_engine import compute_risk, severity_for  # noqa: F401  (re-exported)
 
-
-def severity_for(score: int) -> Severity:
-    if score >= 1800:
-        return Severity.CRITICAL
-    if score >= 1400:
-        return Severity.HIGH
-    if score >= 1000:
-        return Severity.MEDIUM
-    return Severity.LOW
-
-
-def compute_risk_elo(f: EloFactors) -> EloBreakdown:
-    """The only function that produces a Risk Elo. Pure and deterministic."""
-    candidates: List[Tuple[int, str]] = []
-    if f.cvss is not None:
-        candidates.append((int(round(f.cvss * 200)), f"CVSS {f.cvss:.1f} x 200"))
-    if f.pre_cve_threat:
-        candidates.append((PRE_CVE_BASE, "pre-CVE tampering / typosquat / malicious hook"))
-    if f.static_hygiene:
-        candidates.append((HYGIENE_BASE, "static supply-chain hygiene anomaly"))
-    base, reason = max(candidates) if candidates else (0, "no threat signal")
-    deltas: List[EloDelta] = []
-    if f.is_symbol_called is True:
-        deltas.append(EloDelta(label="Tier 0 -> vulnerable symbol path confirmed", value=DELTA_SYMBOL_CALLED))
-    elif f.is_symbol_called is False:
-        deltas.append(EloDelta(label="package imported but vulnerable symbol never called", value=DELTA_SYMBOL_NOT_CALLED))
-    if f.auto_exec_hook:
-        deltas.append(EloDelta(label="auto-executing install hook", value=DELTA_AUTO_EXEC_HOOK))
-    if f.public_route:
-        deltas.append(EloDelta(label="reachable from public unauthenticated route", value=DELTA_PUBLIC_ROUTE))
-    if f.dev_or_test_only:
-        deltas.append(EloDelta(label="isolated to devDependencies / test code", value=DELTA_DEV_OR_TEST))
-    if f.provenance_flags:
-        deltas.append(EloDelta(label="provenance: " + "; ".join(sorted(set(f.provenance_flags))), value=DELTA_PROVENANCE))
-    total = base + sum(d.value for d in deltas)
-    return EloBreakdown(factors=f, base=base, base_reason=reason, deltas=deltas, total=total,
-                        severity=severity_for(total))
+# Exposure override when the deployment context is known: internet | internal | auto
+EXPOSURE_OVERRIDE = {"internet": "public_route", "internal": "internal"}
 
 
 # --------------------------------------------------------------------------- #
@@ -186,7 +141,7 @@ class AttackTree:
     # ---- graph primitives ------------------------------------------------- #
     def _node(self, nid: str, label: str, tier: Tier, **attrs: object) -> str:
         if nid not in self.g:
-            self.g.add_node(nid, label=label, tier=tier, finding_ids=[], risk_elo=None, severity=None, **attrs)
+            self.g.add_node(nid, label=label, tier=tier, finding_ids=[], risk_score=None, severity=None, **attrs)
         return nid
 
     def _edge(self, src: str, dst: str, relation: str, ev: Evidence) -> None:
@@ -316,14 +271,14 @@ class AttackTree:
         self.findings[finding.id] = finding
         sink = self.g.nodes[finding.sink_node]
         sink["finding_ids"].append(finding.id)
-        sink["risk_elo"] = finding.elo.total
-        sink["severity"] = finding.elo.severity
+        sink["risk_score"] = finding.risk.total
+        sink["severity"] = finding.risk.severity
         for anc in nx.ancestors(self.g, finding.sink_node):
             node = self.g.nodes[anc]
             node["finding_ids"].append(finding.id)
-            if node["risk_elo"] is None or finding.elo.total > node["risk_elo"]:
-                node["risk_elo"] = finding.elo.total
-                node["severity"] = finding.elo.severity
+            if node["risk_score"] is None or finding.risk.total > node["risk_score"]:
+                node["risk_score"] = finding.risk.total
+                node["severity"] = finding.risk.severity
         finding.call_chain_depth = self.call_chain_depth(finding.sink_node)
 
     def call_chain_depth(self, sink: str) -> Optional[int]:
@@ -373,6 +328,66 @@ class AttackTree:
                     return True, CallSite(psite.file, psite.line, psite.text, f"{parent} -> {comp.name}: {why}"), symbols
         return None, None, symbols
 
+    def _reach_state(self, called: Optional[bool], comp: Component, chain: List[str]) -> str:
+        """Map static reachability onto the engine's states (confirmed/imported/unknown/not_called/not_imported)."""
+        if called is True:
+            return "confirmed"
+        if called is False:
+            return "not_called"
+        # Every direct dependency that pulls this package in (not just the first chain): it is only
+        # "not imported" when first-party code imports none of them.
+        if comp.is_direct:
+            roots = {comp.name}
+        else:
+            idx = self.dependency_index()
+            roots = {self.comp_by_purl[d].name for d in idx.introduced_by.get(comp.purl, set()) if d in self.comp_by_purl}
+            if not roots and chain:
+                roots = {self.comp_by_purl[chain[0]].name} if chain[0] in self.comp_by_purl else set()
+        imported = {s.package for s in self.imports if s.package}
+        if roots and not roots & imported:
+            return "not_imported" if self.imports else "unknown"
+        return "imported" if comp.is_direct else "unknown"
+
+    def _detect_network_service(self) -> None:
+        """Is the application a network service at all? (server entrypoint, listen(), Dockerfile EXPOSE)"""
+        self.network_service: Optional[str] = None
+        for entry in ("server.ts", "server.js", "app.ts", "app.js", "index.js", "index.ts", "main.ts", "main.js"):
+            for i, ln in enumerate(self.src.lines(entry), 1):
+                if re.search(r"\.listen\s*\(|createServer\s*\(", ln):
+                    self.network_service = f"{entry}:{i} {ln.strip()[:80]}"
+                    return
+        for df in list(self.repo.glob("Dockerfile*"))[:5]:
+            for i, ln in enumerate((read_text(df) or "").splitlines(), 1):
+                if re.match(r"^\s*EXPOSE\s+\d+", ln, re.I):
+                    self.network_service = f"{df.name}:{i} {ln.strip()}"
+                    return
+        if any(k in self._public for k in ("server.ts", "server.js", "app.ts", "app.js")):
+            self.network_service = "HTTP server entrypoint"
+
+    def _exposure(self, public: bool, pkg_node: str) -> Tuple[str, str, Optional[str]]:
+        override = EXPOSURE_OVERRIDE.get(os.environ.get("SCG_EXPOSURE", "auto").lower())
+        if override:
+            return override, "override", f"SCG_EXPOSURE={os.environ.get('SCG_EXPOSURE')}"
+        if public:
+            exp = next((self.g.nodes[a].get("public_evidence") for a in nx.ancestors(self.g, pkg_node)
+                        if self.g.nodes[a].get("public")), None)
+            return "public_route", "static", (f"{exp['file']}:{exp['line']} {exp['detail']}" if exp else None)
+        if self.network_service:
+            return "network_service", "static", self.network_service
+        return "internal", "static", "no server entrypoint, listen() or EXPOSE found"
+
+    def update_finding_risk(self, finding_id: str, factors: RiskFactors) -> Finding:
+        """Re-score a finding from new *verified* factors (e.g. an agent-found call site) and re-propagate."""
+        f = self.findings[finding_id]
+        f.risk = compute_risk(factors)
+        for nid in [f.sink_node, *nx.ancestors(self.g, f.sink_node)]:
+            node = self.g.nodes[nid]
+            ids = [i for i in node["finding_ids"] if i in self.findings]
+            worst = max((self.findings[i] for i in ids), key=lambda x: x.risk.total, default=None)
+            node["risk_score"] = worst.risk.total if worst else None
+            node["severity"] = worst.risk.severity if worst else None
+        return f
+
     def add_vulnerabilities(self) -> None:
         seen: Set[Tuple[str, str]] = set()
         for v in self.vulns:
@@ -400,19 +415,27 @@ class AttackTree:
                 rel = "affected_by"
             self._edge(pkg_node, sink, rel, ev)
             public, test_only = self._path_exposure(pkg_node)
-            provenance = [f"lockfile hash mutated for {comp.name}" for a in self.anomalies
-                          if a.kind == AnomalyKind.LOCKFILE_HASH_MUTATION and a.purl == v.purl]
-            factors = EloFactors(cvss=v.cvss_score if v.cvss_score is not None else 5.0,
-                                 pre_cve_threat=v.is_malicious, is_symbol_called=called,
-                                 public_route=public and called is not False,
-                                 dev_or_test_only=comp.is_dev or test_only, provenance_flags=provenance)
+            reach = self._reach_state(called, comp, chains[0])
+            exposure, exp_src, exp_ev = self._exposure(public, pkg_node)
+            static_src = [IntelSource(name="static analysis", value=f"reachability: {reach}" +
+                                      (f" ({site.symbol} at {site.file}:{site.line})" if site else "")),
+                          IntelSource(name="static analysis" if exp_src == "static" else "SCG_EXPOSURE override",
+                                      value=f"exposure: {exposure}" + (f" ({exp_ev})" if exp_ev else ""))]
+            factors = RiskFactors(
+                cvss=v.cvss_score, cvss_source=v.cvss_source, epss=v.epss, epss_percentile=v.epss_percentile, kev=v.kev,
+                reachability=reach, exposure=exposure, exposure_source=exp_src,
+                dev_or_test_only=comp.is_dev or test_only,
+                dependency_depth=self.dep_index.depth.get(v.purl) if self.dep_index else None,
+                threat_class="malicious" if v.is_malicious else None,
+                version_uncertain=comp.version_source in ("manifest-range-floor", "manifest-unresolvable"),
+                demo_data=v.source in ("demo", "drift-demo"), sources=[*v.intel_sources, *static_src])
             primary = ev if site else next(
                 (Evidence(kind=EvidenceKind.MANIFEST, file=o.file_path, line=o.line_number, detail=o.text)
                  for o in self.comp_by_purl[chains[0][0]].occurrences if o.file_path == "package.json"), ev)
             self._register(Finding(
                 id=self._new_id(), title=f"{v.id} in {comp.name}@{comp.version}: {v.summary[:90]}",
                 kind="vulnerability", purl=v.purl, package=comp.name, version=comp.version,
-                advisory_ids=[v.id, *v.aliases], sink_node=sink, elo=compute_risk_elo(factors),
+                advisory_ids=[v.id, *v.aliases], sink_node=sink, risk=compute_risk(factors),
                 primary_evidence=primary, symbols=[sym_label], patched_versions=v.patched_versions,
                 references=v.references))
 
@@ -445,14 +468,15 @@ class AttackTree:
                 flags.append("unpinned :latest Docker tag")
             elif a.provenance_risk:
                 flags.append(a.title)
-            pre_cve = a.kind in (AnomalyKind.SUSPICIOUS_HOOK, AnomalyKind.LOCKFILE_HASH_MUTATION,
-                                 AnomalyKind.TYPOSQUAT, AnomalyKind.MALICIOUS_PACKAGE)
-            factors = EloFactors(pre_cve_threat=pre_cve, static_hygiene=not pre_cve,
-                                 auto_exec_hook=a.auto_executes and a.kind == AnomalyKind.SUSPICIOUS_HOOK,
-                                 provenance_flags=flags)
+            threat = {AnomalyKind.SUSPICIOUS_HOOK: "suspicious_hook", AnomalyKind.LOCKFILE_HASH_MUTATION: "tamper",
+                      AnomalyKind.TYPOSQUAT: "typosquat", AnomalyKind.MALICIOUS_PACKAGE: "malicious"}.get(a.kind, a.kind.value)
+            factors = RiskFactors(threat_class=threat, exposure="unknown",
+                                  auto_exec_hook=a.auto_executes and a.kind == AnomalyKind.SUSPICIOUS_HOOK,
+                                  provenance_flags=flags,
+                                  sources=[IntelSource(name="static analysis", value=f"{a.kind.value} at {a.file}:{a.line}")])
             self._register(Finding(
                 id=self._new_id(), title=a.title, kind="anomaly", purl=a.purl, package=a.package,
-                advisory_ids=[a.id], sink_node=sink, elo=compute_risk_elo(factors), primary_evidence=ev,
+                advisory_ids=[a.id], sink_node=sink, risk=compute_risk(factors), primary_evidence=ev,
                 symbols=[a.kind.value]))
 
     def add_admission(self, res: AdmissionResult) -> Finding:
@@ -477,29 +501,46 @@ class AttackTree:
             flags.append(f"typosquat distance 1 to {res.typosquat_target}")
         if any(s.name == "release_age" for s in triggered):
             flags.append("package age < 7 days")
-        pre_cve = hook_sinks or res.typosquat_distance == 1 or any(
-            s.name in ("known_malicious", "nonexistent_package") for s in triggered)
-        cvss = max((v.cvss_score or 0.0 for v in res.vulnerabilities), default=None) if res.vulnerabilities else None
-        factors = EloFactors(cvss=cvss, pre_cve_threat=pre_cve,
-                             auto_exec_hook=any(s.name == "install_hook" for s in triggered),
-                             provenance_flags=flags)
+        names = {s.name for s in triggered}
+        threat: Optional[str]
+        if "known_malicious" in names:
+            threat = "malicious"
+        elif "nonexistent_package" in names:
+            threat = "nonexistent"
+        elif res.typosquat_distance == 1:
+            threat = "typosquat"
+        elif hook_sinks:
+            threat = "suspicious_hook"
+        elif res.vulnerabilities:
+            threat = None              # score the worst known advisory like any other CVE
+        else:
+            threat = "admission_signals" if names - {"missing_provenance"} else "clean"
+        worst = max(res.vulnerabilities, key=lambda v: v.cvss_score or 0.0) if res.vulnerabilities else None
+        factors = RiskFactors(
+            cvss=worst.cvss_score if worst and threat is None else None,
+            cvss_source=worst.cvss_source if worst and threat is None else None,
+            threat_class=threat, auto_exec_hook=any(s.name == "install_hook" for s in triggered),
+            provenance_flags=flags,
+            sources=[IntelSource(name="registry metadata" if res.metadata_source == "registry" else res.metadata_source,
+                                 value=f"{shown}: signals {sorted(names) or 'none'}", as_of=res.published)])
         finding = Finding(
             id=self._new_id(), title=f"Pre-install admission: {shown}", kind="admission",
             purl=res.purl, package=res.package, version=res.version,
             advisory_ids=[v.id for v in res.vulnerabilities] or [s.name for s in triggered],
-            sink_node=sink, elo=compute_risk_elo(factors), primary_evidence=primary,
+            sink_node=sink, risk=compute_risk(factors), primary_evidence=primary,
             symbols=[s.name for s in triggered])
         self._register(finding)
         return finding
 
     # ---- build & export ---------------------------------------------------- #
     def build(self) -> "AttackTree":
+        self.dep_index = DependencyIndex(self.sbom)
         self._compute_public_routes()
+        self._detect_network_service()
         self.add_vulnerabilities()
         self.add_anomalies()
         self._renumber()
         self._assign_depths()
-        self.dep_index = DependencyIndex(self.sbom)
         self.fix_groups = attach_fix_recommendations(self.findings.values(), self.sbom, self.vulns, self.dep_index)
         self.log("attack-tree", f"graph: {self.g.number_of_nodes()} nodes, {self.g.number_of_edges()} evidence-backed "
                                 f"edges, {len(self.findings)} findings", "success")
@@ -515,8 +556,8 @@ class AttackTree:
         return self.dep_index
 
     def _renumber(self) -> None:
-        """Stable ordering: highest Elo first."""
-        ordered = sorted(self.findings.values(), key=lambda f: (-f.elo.total, f.title))
+        """Stable ordering: highest risk score first (ties: higher confidence first)."""
+        ordered = sorted(self.findings.values(), key=lambda f: (-f.risk.total, -f.risk.confidence, f.title))
         mapping = {f.id: f"F-{i:03d}" for i, f in enumerate(ordered, 1)}
         for f in ordered:
             f.id = mapping[f.id]
@@ -550,18 +591,18 @@ class AttackTree:
         return Kpis(
             total_components=len(self.sbom.components),
             raw_scanner_alerts=len({(v.id, v.purl) for v in self.vulns}) + sum(a.scored for a in self.anomalies),
-            actionable_critical=sum(f.elo.severity == Severity.CRITICAL for f in fs),
-            downgraded_noise=sum(f.elo.severity == Severity.LOW for f in fs),
+            actionable_critical=sum(f.risk.severity == Severity.CRITICAL for f in fs),
+            downgraded_noise=sum(f.risk.severity == Severity.LOW for f in fs),
         )
 
     def to_payload(self) -> GraphPayload:
         nodes = []
         for nid, d in self.g.nodes(data=True):
-            extra = {k: v for k, v in d.items() if k not in {"label", "tier", "finding_ids", "risk_elo", "severity",
+            extra = {k: v for k, v in d.items() if k not in {"label", "tier", "finding_ids", "risk_score", "severity",
                                                               "depth", "purl", "file", "line"}}
             nodes.append(AttackNode(id=nid, label=d["label"], tier=d["tier"], depth=d.get("depth", 0),
                                     purl=d.get("purl"), file=d.get("file"), line=d.get("line"),
-                                    risk_elo=d["risk_elo"], severity=d["severity"],
+                                    risk_score=d["risk_score"], severity=d["severity"],
                                     finding_ids=d["finding_ids"], attrs=extra))
         edges = [AttackEdge(source=a, target=b, relation=d["relation"], evidence=d["evidence"])
                  for a, b, d in self.g.edges(data=True)]

@@ -222,13 +222,13 @@ def group_fixes(findings: List[Finding], idx: DependencyIndex) -> List[FixGroup]
             command, action = fs[0].fix.command, fs[0].fix.action
         if len(fs) > 1 and kind in ("upgrade-direct", "refresh-lockfile"):
             action += f" (fixes {len(fs)} findings)"
-        worst = max(fs, key=lambda f: (f.elo.total, _SEV_RANK[f.elo.severity]))
+        worst = max(fs, key=lambda f: (f.risk.total, _SEV_RANK[f.risk.severity]))
         groups.append(FixGroup(
             id="", kind=kind, target=target, to=to, action=action, command=command,
-            findings=sorted(f.id for f in fs), packages=pkgs, max_severity=worst.elo.severity,
-            max_elo=worst.elo.total,
-            runtime=any(not f.elo.factors.dev_or_test_only for f in fs)))
-    groups.sort(key=lambda g: (-g.max_elo, -len(g.findings), g.target))
+            findings=sorted(f.id for f in fs), packages=pkgs, max_severity=worst.risk.severity,
+            max_score=worst.risk.total,
+            runtime=any(not f.risk.factors.dev_or_test_only for f in fs)))
+    groups.sort(key=lambda g: (-g.max_score, -len(g.findings), g.target))
     by_finding = {f.id: f for f in findings}
     for i, g in enumerate(groups, 1):
         g.id = f"G-{i:02d}"

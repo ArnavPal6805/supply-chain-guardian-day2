@@ -1,0 +1,4 @@
+package,current_version,target_version,action,notes
+qs,*,6.16.0,UPGRADE_TO_SAFER,platform team tested 6.16.0 with express 4.x
+minimist,<1.2.6,1.2.8,UPGRADE_TO_SAFER,approved upgrade path from the 2026 Q3 review
+event-stream,*,,BLOCK_UNSAFE_COMPONENT,never allow: 2018 maintainer takeover

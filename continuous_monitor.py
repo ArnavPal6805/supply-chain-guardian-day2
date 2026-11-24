@@ -37,6 +37,12 @@ from models import (
 )
 from attack_tree import AttackTree, build_dependency_graph
 from orchestrator import LogBus, Orchestrator, ScanContext
+from risk_engine import KEV_FLOOR_REACHABLE
+import threat_intel
+from mitigation_engine import HumanDecisionType, MitigationDecisionPackage, record_human_decision
+from remediation_agent import LeadRemediationAgent
+
+BLOCK_SCORE = KEV_FLOOR_REACHABLE   # admission gate blocks at Critical (>= 80) or on any hard-block signal
 from scanners import (
     LOCKFILES,
     _sbom_from_lock,
@@ -90,6 +96,103 @@ class Engine:
         self.use_llm = True
         self.daemon = DriftDaemon(self)
         self.sources: Dict[Path, str] = {}   # local path -> GitHub URL it was cloned from
+        self.intel_status: Dict[str, Any] = {}
+        # STATE["mitigations"][finding_id] and STATE["decision_log"]: mutated in place, shared with the API
+        self.state: Dict[str, Any] = {"mitigations": {}, "decision_log": []}
+        self._decisions: Dict[str, Dict[str, Any]] = {}     # stable key -> last human decision
+        self._decisions_repo: Optional[Path] = None
+        self.remediation: Optional[LeadRemediationAgent] = None
+        self._rem_thread: Optional[threading.Thread] = None
+
+    # ---- agentic remediation (isolated workspace, human approval boundary) ---- #
+    def start_remediation(self, finding_ids: Optional[List[str]] = None, max_iterations: int = 5,
+                          run_tests: bool = False, use_llm: bool = True, background: bool = True) -> Dict[str, Any]:
+        with self.lock:
+            if self._rem_thread and self._rem_thread.is_alive():
+                raise ValueError("a remediation session is already running")
+            if self.ctx is None or self.orch is None:
+                raise ValueError("run a scan first")
+            from orchestrator import LLMClient
+            llm = None
+            if use_llm and self.use_llm:
+                llm = LLMClient()
+                llm.log = self.log
+                if not (llm.enabled and LLMClient.sdk_available(llm.provider)):
+                    llm = None
+            unknown = [f for f in (finding_ids or []) if f not in self.ctx.tree.findings]
+            if unknown:
+                raise ValueError(f"unknown finding ids: {unknown}")
+            if self.remediation is not None and self.remediation.mem.status != "applied":
+                self.remediation.cleanup()
+            agent = LeadRemediationAgent(self.ctx, dict(self.state["mitigations"]), self.log, llm=llm,
+                                         max_iterations=max_iterations, finding_ids=finding_ids, run_tests=run_tests)
+            self.remediation = agent
+        if background:
+            self._rem_thread = threading.Thread(target=agent.run, name="remediation-agent", daemon=True)
+            self._rem_thread.start()
+        else:
+            agent.run()
+        return self.remediation_state()
+
+    def remediation_state(self) -> Dict[str, Any]:
+        a = self.remediation
+        if a is None:
+            return {"session": None}
+        running = bool(self._rem_thread and self._rem_thread.is_alive())
+        return {"session": a.mem.model_dump(mode="json"), "running": running}
+
+    def stop_remediation(self) -> Dict[str, Any]:
+        if self.remediation is not None:
+            self.remediation.stop_flag.set()
+        return self.remediation_state()
+
+    # ---- human validation gate ---------------------------------------------- #
+    def _decision_file(self, repo: Path) -> Path:
+        return repo_cache_dir(repo) / "decisions.jsonl"
+
+    def _load_decisions(self, repo: Path) -> None:
+        if self._decisions_repo == repo:
+            return
+        self._decisions, self._decisions_repo = {}, repo
+        self.state["decision_log"].clear()
+        f = self._decision_file(repo)
+        if f.exists():
+            for line in f.read_text(encoding="utf-8").splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                self.state["decision_log"].append(entry)
+                self._decisions[entry["stable_key"]] = entry
+
+    def validate_mitigation(self, finding_id: str, decision: Any, reviewer: str, justification: str,
+                            chosen_candidate_id: Optional[str] = None) -> MitigationDecisionPackage:
+        with self.lock:
+            pkg = self.state["mitigations"].get(finding_id)
+            if pkg is None:
+                raise KeyError(f"no mitigation package for finding {finding_id}")
+            updated = record_human_decision(pkg, decision, reviewer, justification, chosen_candidate_id)
+            hv = updated.human_validation
+            chosen = next((c for c in updated.candidates if c.candidate_id == hv.chosen_candidate_id), None)
+            entry = {"ts": hv.decided_at, "finding_id": finding_id, "stable_key": updated.stable_key,
+                     "package": f"{updated.package_name}@{updated.current_version}", "risk_score": updated.risk_score,
+                     "requires_human_validation": updated.requires_human_validation,
+                     "previous_decision": pkg.human_validation.decision.value, "decision": hv.decision.value,
+                     "chosen_candidate_id": hv.chosen_candidate_id,
+                     "chosen_action": chosen.action_type.value if chosen else None,
+                     "chosen_target": chosen.target_version_or_ref if chosen else None,
+                     "apply_command": chosen.apply_command if chosen else None,
+                     "reviewer": hv.reviewer, "justification": hv.justification, "decided_at": hv.decided_at}
+            self.state["mitigations"][finding_id] = updated
+            self.state["decision_log"].append(entry)
+            self._decisions[updated.stable_key] = entry
+            if self.ctx is not None:
+                with self._decision_file(self.ctx.repo).open("a", encoding="utf-8") as fh:   # append-only audit trail
+                    fh.write(json.dumps(entry) + "\n")
+            self.log("human-gate", f"{finding_id} {hv.decision.value} by {hv.reviewer}"
+                                   + (f" -> {chosen.candidate_id} ({chosen.target_version_or_ref})" if chosen else ""), "success")
+            self.refresh_result()
+            return updated
 
     def resolve(self, source: str, refresh: bool = False) -> Path:
         """Local path or public GitHub URL -> validated local repository path."""
@@ -107,6 +210,7 @@ class Engine:
             self.log("engine", f"full read-only scan of {self.sources.get(repo, repo)}", "info")
             sbom, imports = run_cdxgen(repo, self.log, use_cache=use_cache, resolve_lockfile=resolve_lockfile)
             vulns, vuln_source = run_osv_scanner(sbom, self.log)
+            self.intel_status = threat_intel.enrich(vulns, self.log)
             cache = repo_cache_dir(repo)
             baseline = cache / "baseline_sbom.json"
             ref = "HEAD~1"
@@ -134,20 +238,35 @@ class Engine:
                 card = self.orch.triage_finding(f, allow_llm=bool(set(f.advisory_ids) & llm_advisories))
                 self.ctx.cards[f.id] = card
                 cards.append(card)
+        for g in tree.fix_groups:          # an agent-verified call site may have raised a finding's score
+            fs = [tree.findings[i] for i in g.findings if i in tree.findings]
+            if fs:
+                worst = max(fs, key=lambda x: x.risk.total)
+                g.max_score, g.max_severity = worst.risk.total, worst.risk.severity
         for res in admissions.values():   # keep earlier gate decisions visible in the graph
             self._attach_admission(res)
+        self._load_decisions(repo)
+        self.state["mitigations"].clear()
+        self.state["mitigations"].update(self.orch.build_mitigations(self._decisions))
         notes = list(sbom.notes)
         if repo in self.sources:
             notes.insert(0, f"Scanned a shallow clone of {self.sources[repo]} (hooks, LFS and symlinks disabled).")
         if vuln_source == "demo":
             notes.append("Advisories are built-in DEMO data (scanner and OSV API unavailable).")
+        st = self.intel_status
+        if vulns and not st.get("kev_checked"):
+            notes.append("CISA KEV was not checked (offline or unavailable): KEV is scored as unknown and confidence is lowered.")
+        if vulns and not st.get("epss_checked"):
+            notes.append("FIRST EPSS was not checked (offline or unavailable): an EPSS prior of 0.01 is used and confidence is lowered.")
         idx = tree.dependency_index()
         self.last_result = ScanResult(
             repo_path=str(repo), sbom_source=sbom.source, vuln_source=vuln_source, kpis=tree.kpis(),
             findings=list(tree.findings.values()), cards=list(self.ctx.cards.values()), anomalies=anomalies,
             graph=tree.to_payload(),
             dependency_graph=build_dependency_graph(sbom, tree.findings.values(), repo.name, idx),
-            dependency_stats=idx.stats(), fix_groups=tree.fix_groups, notes=notes)
+            dependency_stats=idx.stats(), fix_groups=tree.fix_groups, intel=dict(self.intel_status),
+            mitigations={k: v.model_dump(mode="json") for k, v in self.state["mitigations"].items()},
+            decision_log=list(self.state["decision_log"])[-200:], notes=notes)
         k = self.last_result.kpis
         self.log("engine", f"done: {k.total_components} components | {k.raw_scanner_alerts} raw alerts | "
                            f"{k.actionable_critical} critical | {k.downgraded_noise} downgraded noise", "success")
@@ -170,6 +289,8 @@ class Engine:
                                                                        self.ctx.repo.name, t.dependency_index())
             self.last_result.fix_groups = t.fix_groups
             self.last_result.kpis = t.kpis()
+            self.last_result.mitigations = {k: v.model_dump(mode="json") for k, v in self.state["mitigations"].items()}
+            self.last_result.decision_log = list(self.state["decision_log"])[-200:]
         return self.last_result
 
     # ---- pre-install admission gate ----------------------------------------- #
@@ -178,7 +299,7 @@ class Engine:
         self.ctx.admissions[res.purl] = res
         finding = self.ctx.tree.add_admission(res)
         hard = [s for s in res.signals if s.triggered and s.hard_block]
-        res.decision = Decision.BLOCKED if hard or finding.elo.total >= 1800 else Decision.APPROVED
+        res.decision = Decision.BLOCKED if hard or finding.risk.total >= BLOCK_SCORE else Decision.APPROVED
         res.card = self.orch.triage_finding(finding, allow_llm=True)
         self.ctx.cards[finding.id] = res.card
         return res
@@ -193,8 +314,11 @@ class Engine:
             if existing:
                 res.errors.append(f"note: replaces existing {name}@{existing[0].version} in the attack tree")
             res = self._attach_admission(res)
+            fid = res.card.finding.finding_id if res.card else None
+            if fid and self.orch is not None:
+                self.state["mitigations"].update(self.orch.build_mitigations(self._decisions, [fid]))
             level = "error" if res.decision == Decision.BLOCKED else "success"
-            self.log("pre_cve_gate", f"{res.decision.value}: {name}@{res.version} (Risk Elo {res.card.risk.total if res.card else '?'})", level)
+            self.log("pre_cve_gate", f"{res.decision.value}: {name}@{res.version} (risk {res.card.risk.total if res.card else '?'}/100)", level)
             self.refresh_result()
             return res
 
@@ -353,16 +477,16 @@ class Engine:
                 sim_ctx.admissions[adm.purl] = adm
                 finding = sim_tree.add_admission(adm)
                 hard = [s for s in adm.signals if s.triggered and s.hard_block]
-                adm.decision = Decision.BLOCKED if hard or finding.elo.total >= 1800 else Decision.APPROVED
+                adm.decision = Decision.BLOCKED if hard or finding.risk.total >= BLOCK_SCORE else Decision.APPROVED
                 adm.card = sim_orch.triage_finding(finding, allow_llm=True)
                 cards.append(adm.card)
-                max_elo = max(c.risk.total for c in cards)
-                blocked = adm.decision == Decision.BLOCKED and all(c.risk.total >= 2200 for c in cards)
+                max_score = max(c.risk.total for c in cards)
+                blocked = adm.decision == Decision.BLOCKED and all(c.risk.total >= BLOCK_SCORE for c in cards)
                 self.log("simulator", f"{'INTERCEPTED & BLOCKED' if blocked else 'NOT FULLY BLOCKED'}: "
-                                      f"{len(cards)} card(s), max Risk Elo {max_elo}", "success" if blocked else "error")
+                                      f"{len(cards)} card(s), max risk {max_score}/100", "success" if blocked else "error")
                 return SimulationResult(sandbox_dir=str(sandbox), sandbox_removed=not keep_sandbox, injected=injected,
                                         admission=adm, anomalies=anomalies, cards=cards, blocked=blocked,
-                                        max_elo=max_elo, graph=sim_tree.to_payload(), safety_notes=notes)
+                                        max_score=max_score, graph=sim_tree.to_payload(), safety_notes=notes)
             finally:
                 if not keep_sandbox:
                     shutil.rmtree(sandbox, ignore_errors=True)
@@ -453,13 +577,25 @@ class DriftDaemon:
             if self._demo_drift and self.status.polls == 1:
                 fresh = fresh + [self._synthetic_advisory(ctx)]
             new = [v for v in fresh if (v.id, v.purl) not in known]
+            if new:
+                threat_intel.enrich(new, eng.log)
+            # Exploitation drift: an already-known advisory that has since been added to KEV
+            # (or whose EPSS jumped) changes priority even though no new advisory appeared.
+            before = {(v.id, v.purl): (v.kev, v.epss) for v in ctx.vulns}
+            threat_intel.enrich(ctx.vulns, eng.log)
+            escalated = sorted({v.id for v in ctx.vulns if (v.kev and not before[(v.id, v.purl)][0]) or
+                                (v.epss is not None and (before[(v.id, v.purl)][1] or 0) < 0.1 <= v.epss)})
             self.status.polls += 1
             self.status.last_poll = utcnow()
-            if new:
+            if new or escalated:
                 ids = sorted({v.id for v in new})
-                self.status.new_advisories = (self.status.new_advisories + ids)[-50:]
-                eng.log("drift-daemon", f"ZERO-DAY DRIFT: {len(new)} newly disclosed advisory(ies): {', '.join(ids[:5])}", "warn")
-                eng._build(ctx.repo, ctx.sbom, ctx.imports, ctx.vulns + new, ctx.anomalies, source, llm_advisories=set(ids))
+                self.status.new_advisories = (self.status.new_advisories + ids + escalated)[-50:]
+                if ids:
+                    eng.log("drift-daemon", f"ZERO-DAY DRIFT: {len(new)} newly disclosed advisory(ies): {', '.join(ids[:5])}", "warn")
+                if escalated:
+                    eng.log("drift-daemon", f"EXPLOITATION DRIFT: now in CISA KEV or EPSS >= 0.1: {', '.join(escalated[:5])}", "warn")
+                eng._build(ctx.repo, ctx.sbom, ctx.imports, ctx.vulns + new, ctx.anomalies, source,
+                           llm_advisories=set(ids) | set(escalated))
             else:
                 eng.log("drift-daemon", "no new advisories", "info")
             self.status.known_advisories = len(known) + len(new)

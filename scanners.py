@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -568,6 +569,9 @@ def resolve_lockfile_metadata_only(repo: Path, log: LogFn = _noop_log, timeout: 
     """
     out = repo_cache_dir(repo) / "resolved-package-lock.json"
     manifest = repo / "package.json"
+    if offline_mode():
+        log("lockfile-resolver", "SCG_OFFLINE=1: not resolving a lockfile from the registry", "warn")
+        return None
     if not manifest.exists() or shutil.which("npm") is None:
         log("lockfile-resolver", "npm or package.json missing; cannot resolve lockfile", "warn")
         return None
@@ -863,7 +867,7 @@ def fixed_version_for(rec: Dict[str, Any], eco: str, name: str, version: str) ->
 
 def parse_osv_record(rec: Dict[str, Any], pkg_name: str, version: str, purl: str, source: str,
                      ecosystem: str = "npm") -> Vulnerability:
-    score, vector = None, None
+    score, vector, cvss_source = None, None, None
     for sev in rec.get("severity", []) or []:
         if sev.get("type", "").startswith("CVSS_V3"):
             vector = sev.get("score")
@@ -874,9 +878,12 @@ def parse_osv_record(rec: Dict[str, Any], pkg_name: str, version: str, purl: str
             if score is None and sev.get("type", "").startswith("CVSS_V3"):
                 vector = sev.get("score")
                 score = cvss3_base_score(vector or "")
+    if score is not None:
+        cvss_source = "osv-vector"
     if score is None and label:
         score = _LABEL_SCORE.get(str(label).upper())
         vector = vector or f"estimated-from-label:{label}"
+        cvss_source = "label-estimate" if score is not None else None
     patched: List[str] = []
     funcs: List[str] = []
     for aff in rec.get("affected", []) or []:
@@ -893,6 +900,11 @@ def parse_osv_record(rec: Dict[str, Any], pkg_name: str, version: str, purl: str
         id=rec.get("id", "UNKNOWN"), aliases=rec.get("aliases", []) or [], package=pkg_name, version=version,
         purl=purl, summary=rec.get("summary") or (rec.get("details") or "")[:200], cvss_score=score,
         cvss_vector=vector, severity_label=label, patched_versions=patched, fixed_in=fixed_in, affected_since=since,
+        cvss_source=cvss_source, modified=rec.get("modified"),
+        details=(rec.get("details") or "")[:2000],
+        fix_commits=[r["url"] for r in rec.get("references", []) or []
+                     if r.get("url") and re.match(r"^https://github\.com/[\w.-]+/[\w.-]+/commit/[0-9a-f]{7,40}/?$", r["url"])
+                     and (r.get("type") in ("FIX", "PACKAGE", None) or "/commit/" in r["url"])][:3],
         references=[r["url"] for r in rec.get("references", []) or [] if r.get("url")][:6],
         affected_functions=funcs, source=source, published=rec.get("published"),
     )
@@ -999,6 +1011,7 @@ def _parse_osv_scanner_json(doc: Dict[str, Any], sbom: Sbom, log: LogFn = _noop_
                     try:
                         v.cvss_score = float(grp["max_severity"])
                         v.cvss_vector = v.cvss_vector or "osv-scanner group max_severity"
+                        v.cvss_source = "scanner-group"
                     except ValueError:
                         pass
                 vulns.append(v)
@@ -1054,8 +1067,189 @@ def run_osv_scanner(sbom: Sbom, log: LogFn = _noop_log) -> Tuple[List[Vulnerabil
             log("osv-api", f"OSV API unavailable ({exc}); using built-in demo advisories", "warn")
     else:
         log("osv-api", "SCG_OFFLINE=1; using built-in demo advisories", "warn")
-    names = {c.name for c in sbom.components}
-    return [v for v in demo_vulnerabilities() if v.package in names], "demo"
+    present = {(c.name, c.version) for c in sbom.components}
+    return [v for v in demo_vulnerabilities() if (v.package, v.version) in present], "demo"
+
+
+# --------------------------------------------------------------------------- #
+# Advisory + release-note context for mitigation candidates (JSON metadata only)
+# --------------------------------------------------------------------------- #
+GITHUB_API = "https://api.github.com"
+ADVISORY_CACHE = CACHE_ROOT / "advisories"
+_GH_BUDGET = {"left": 0}
+
+
+def reset_github_budget(n: Optional[int] = None) -> None:
+    """GitHub allows 60 unauthenticated calls/hour; spend at most this many per scan (GITHUB_TOKEN raises it)."""
+    default = "60" if os.environ.get("GITHUB_TOKEN") else "20"
+    _GH_BUDGET["left"] = int(n if n is not None else os.environ.get("SCG_GITHUB_MAX", default))
+
+
+def _cache_get(kind: str, key: str, ttl: int) -> Optional[Any]:
+    p = ADVISORY_CACHE / kind / (re.sub(r"[^A-Za-z0-9_.@-]", "_", key) + ".json")
+    try:
+        if p.exists() and time.time() - p.stat().st_mtime < ttl:
+            return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _cache_put(kind: str, key: str, data: Any) -> None:
+    d = ADVISORY_CACHE / kind
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (re.sub(r"[^A-Za-z0-9_.@-]", "_", key) + ".json")).write_text(json.dumps(data), encoding="utf-8")
+
+
+def _github_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    if _GH_BUDGET["left"] <= 0 or offline_mode():
+        return None
+    _GH_BUDGET["left"] -= 1
+    headers = {"User-Agent": "supply-chain-guardian/2.0", "Accept": "application/vnd.github+json"}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    try:
+        with httpx.Client(timeout=20, headers=headers) as c:
+            r = c.get(f"{GITHUB_API}{path}", params=params)
+        if r.status_code in (403, 429):
+            _GH_BUDGET["left"] = 0          # rate limited: stop asking for the rest of this scan
+            return None
+        return r.json() if r.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+def _github_repo_of(package: str) -> Optional[Tuple[str, str]]:
+    cached = _cache_get("repo", package, 7 * 86400)
+    if cached is None and not offline_mode() and NPM_NAME_RE.match(package):
+        try:
+            st, doc = _fetch_json(f"https://registry.npmjs.org/{urllib.parse.quote(package, safe='@')}/latest", 15)
+        except httpx.HTTPError:
+            st, doc = 0, None
+        repo = (doc or {}).get("repository") if st == 200 else None
+        url = repo.get("url") if isinstance(repo, dict) else (repo if isinstance(repo, str) else "")
+        m = re.search(r"github\.com[/:]([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[#/].*)?$", url or "")
+        cached = {"owner": m.group(1), "repo": m.group(2)} if m else {}
+        _cache_put("repo", package, cached)
+    return (cached["owner"], cached["repo"]) if cached else None
+
+
+def _github_release_notes(package: str, current: str) -> Tuple[str, Optional[str]]:
+    """Release notes newer than `current`, composed as '## <version>' sections (the changelog parser reads them)."""
+    gh = _github_repo_of(package)
+    if not gh:
+        return "", None
+    key = f"{gh[0]}__{gh[1]}"
+    releases = _cache_get("releases", key, 86400)
+    if releases is None:
+        releases = _github_json(f"/repos/{gh[0]}/{gh[1]}/releases", {"per_page": 100})
+        if not isinstance(releases, list):
+            return "", None
+        releases = [{"tag": r.get("tag_name") or "", "body": (r.get("body") or "")[:4000]} for r in releases]
+        _cache_put("releases", key, releases)
+    parts = []
+    for r in releases:
+        m = re.search(r"(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.]+)?)$", r["tag"]) or re.search(r"(\d+\.\d+\.\d+)", r["tag"])
+        if not m:
+            continue
+        try:
+            if version_cmp(m.group(1), current) <= 0:
+                continue
+        except (ValueError, TypeError):
+            continue
+        parts.append(f"## {m.group(1)}\n{r['body']}")
+    return "\n\n".join(parts)[:40000], f"github.com/{gh[0]}/{gh[1]}/releases"
+
+
+def _ghsa_from_github(ghsa_id: str, package: str, current: str) -> Optional[Dict[str, Any]]:
+    doc = _cache_get("ghsa", ghsa_id, 7 * 86400)
+    if doc is None:
+        doc = _github_json(f"/advisories/{ghsa_id}")
+        if not isinstance(doc, dict):
+            return None
+        doc = {"vulnerabilities": doc.get("vulnerabilities") or [], "updated_at": doc.get("updated_at")}
+        _cache_put("ghsa", ghsa_id, doc)
+    for vul in doc.get("vulnerabilities", []):
+        pk = vul.get("package") or {}
+        if (pk.get("name") or "") != package:
+            continue
+        rng = (vul.get("vulnerable_version_range") or "").replace(",", " ")
+        if rng and satisfies_npm_range(current, rng) is False:
+            continue
+        fp = vul.get("first_patched_version")
+        fp = fp.get("identifier") if isinstance(fp, dict) else fp
+        if fp:
+            return {"patched_version": str(fp), "updated_at": doc.get("updated_at")}
+    return None
+
+
+def satisfies_npm_range(version: str, rng: str) -> Optional[bool]:
+    from versions import npm_satisfies
+    try:
+        return npm_satisfies(version, rng)
+    except (ValueError, TypeError):
+        return None
+
+
+def fetch_advisory_and_changelog_context(repo_path: str, package_name: str, osv_entry: Dict[str, Any],
+                                         current_version: Optional[str] = None, online: bool = True) -> Dict[str, Any]:
+    """Everything the mitigation engine may cite, with where each piece came from.
+
+    * osv_fixed_versions: fixed events from the OSV record that are newer than the installed version
+    * ghsa_data: patched version + upstream fix commit (OSV record of the GHSA, then GitHub's advisory API)
+    * changelog_text: node_modules/<pkg>/CHANGELOG.md if it exists on disk, plus GitHub release notes newer
+      than the installed version (the installed changelog alone never describes the fix version)
+    * csv_override_path: the Guardian's own advisory_overrides.csv (never the scanned repo's)
+    """
+    current = current_version or str(osv_entry.get("version") or "0.0.0")
+    fixed = {str(v) for v in (osv_entry.get("patched_versions") or [])}
+    if osv_entry.get("fixed_in"):
+        fixed.add(str(osv_entry["fixed_in"]))
+    from functools import cmp_to_key
+    # Only the fix for the range that contains the installed version is a real candidate; the other `fixed`
+    # events are backports for other release lines (e.g. 6.7.3 for people on 6.7.x) and only add noise.
+    in_range = osv_entry.get("fixed_in")
+    newer = [str(in_range)] if in_range and version_cmp(str(in_range), current) > 0 else []
+    backports = sorted((v for v in fixed if v not in newer and version_cmp(v, current) > 0), key=cmp_to_key(version_cmp))
+    sources = [f"OSV {osv_entry.get('id')} ({osv_entry.get('source', 'osv')}): fix for the installed range "
+               f"{newer[0] if newer else 'none'}" + (f"; other release lines fixed in {', '.join(backports)}" if backports else "")]
+
+    ghsa_id = next((a for a in [osv_entry.get("id") or "", *(osv_entry.get("aliases") or [])] if str(a).startswith("GHSA-")), None)
+    commits = osv_entry.get("fix_commits") or []
+    commit_url = commits[0].rstrip("/") if commits else None
+    ghsa: Dict[str, Any] = {"id": ghsa_id, "patched_version": osv_entry.get("fixed_in") if ghsa_id else None,
+                            "upstream_patch_commit": commit_url.rsplit("/", 1)[-1] if commit_url else None,
+                            "commit_url": commit_url, "source": "osv-record" if ghsa_id else None}
+    if ghsa_id and online:
+        api = _ghsa_from_github(ghsa_id, package_name, current)
+        if api and api.get("patched_version"):
+            ghsa.update(patched_version=api["patched_version"], source="github-advisory-api", updated_at=api.get("updated_at"))
+            sources.append(f"GitHub advisory {ghsa_id}: first patched {api['patched_version']} (updated {api.get('updated_at')})")
+    if commit_url:
+        sources.append(f"upstream fix commit {commit_url}")
+
+    changelog, where = "", []
+    repo = Path(repo_path)
+    if NPM_NAME_RE.match(package_name):
+        for fname in ("CHANGELOG.md", "HISTORY.md", "CHANGES.md", "History.md"):
+            text = read_text(repo / "node_modules" / package_name / fname, 2_000_000)
+            if text:
+                changelog += text[:40000] + "\n\n"
+                where.append(f"node_modules/{package_name}/{fname}")
+                break
+    if online:
+        notes, src = _github_release_notes(package_name, current)
+        if notes:
+            changelog += notes
+            where.append(src or "GitHub releases")
+    sources.append("release notes: " + (", ".join(where) if where else "none available"))
+
+    csv_path = os.environ.get("SCG_ADVISORY_CSV") or str(PROJECT_ROOT / "advisory_overrides.csv")
+    csv_path = csv_path if Path(csv_path).is_file() else None
+    if csv_path:
+        sources.append(f"CSV feed {Path(csv_path).name}")
+    return {"osv_fixed_versions": newer, "ghsa_data": ghsa, "changelog_text": changelog, "csv_override_path": csv_path,
+            "context_sources": sources}
 
 
 # --------------------------------------------------------------------------- #
@@ -1554,7 +1748,7 @@ def demo_sbom(repo_path: str) -> Sbom:
 def demo_vulnerabilities() -> List[Vulnerability]:
     def v(id_: str, alias: str, pkg: str, ver: str, score: float, summary: str, fixed: str) -> Vulnerability:
         return Vulnerability(id=id_, aliases=[alias], package=pkg, version=ver, purl=npm_purl(pkg, ver),
-                             summary=summary, cvss_score=score, patched_versions=[fixed], fixed_in=fixed, source="demo",
+                             summary=summary, cvss_score=score, cvss_source="demo", patched_versions=[fixed], fixed_in=fixed, source="demo",
                              references=[f"https://osv.dev/vulnerability/{id_}"])
     return [
         v("GHSA-c7hr-j4mj-j2w6", "CVE-2015-9235", "jsonwebtoken", "0.4.0", 9.8,
