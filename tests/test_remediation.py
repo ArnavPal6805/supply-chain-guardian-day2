@@ -50,6 +50,15 @@ def new_agent(e, **kw):
     return LeadRemediationAgent(e.ctx, dict(e.state["mitigations"]), lambda *a: None, **kw)
 
 
+class SbomDiffTests(unittest.TestCase):
+    def test_diff(self) -> None:
+        from remediation_validator import sbom_diff
+        d = sbom_diff({"a": ["1.0.0"], "b": ["2.0.0"]}, {"a": ["1.1.0"], "c": ["3.0.0"]})
+        self.assertEqual(d["added"], ["c@3.0.0"])
+        self.assertEqual(d["removed"], ["b@2.0.0"])
+        self.assertEqual(d["changed"], [{"name": "a", "from": ["1.0.0"], "to": ["1.1.0"]}])
+
+
 class WorkspaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = make_repo()
@@ -111,6 +120,9 @@ class AgentTests(unittest.TestCase):
         events = [json.loads(l)["event"] for l in Path(mem.audit_log).read_text().splitlines()]
         for ev in ("start", "tool_call", "change", "validation", "finish"):
             self.assertIn(ev, events)
+        sd = mem.validations[-1].sbom_diff
+        self.assertEqual(sd["counts"]["before"], sd["counts"]["after"])
+        self.assertIn({"name": "jsonwebtoken", "from": ["0.4.0"], "to": ["4.2.2"]}, sd["changed"])
         diff = a.candidate_diff()["package.json"]
         self.assertIn('+    "jsonwebtoken": "4.2.2"', diff)
         a.cleanup()
@@ -149,8 +161,8 @@ class AgentTests(unittest.TestCase):
         import remediation_agent as ra
         real = ra.validate
 
-        def stuck(ws, iteration, log, baseline=None, previous=None, changes=None, run_tests=False, out=None):
-            res = real(ws, iteration, log, baseline=baseline, previous=previous, changes=changes, out=out)
+        def stuck(ws, iteration, log, baseline=None, previous=None, changes=None, run_tests=False, out=None, **kw):
+            res = real(ws, iteration, log, baseline=baseline, previous=previous, changes=changes, out=out, **kw)
             if baseline is not None:          # pretend nothing ever gets fixed
                 res.findings, res.resolved_this_iteration, res.resolved_vs_baseline = list(baseline.findings), [], []
                 res.risk, res.verdict = dict(baseline.risk), "no_change"
@@ -174,8 +186,8 @@ class AgentTests(unittest.TestCase):
         real = ra.validate
         calls = {"n": 0}
 
-        def regress_once(ws, iteration, log, baseline=None, previous=None, changes=None, run_tests=False, out=None):
-            res = real(ws, iteration, log, baseline=baseline, previous=previous, changes=changes, out=out)
+        def regress_once(ws, iteration, log, baseline=None, previous=None, changes=None, run_tests=False, out=None, **kw):
+            res = real(ws, iteration, log, baseline=baseline, previous=previous, changes=changes, out=out, **kw)
             if baseline is not None and calls["n"] == 0:
                 calls["n"] += 1
                 res.new_vs_baseline = [FindingState(key="vuln|jsonwebtoken|GHSA-new", title="new", kind="vulnerability",

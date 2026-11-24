@@ -351,12 +351,13 @@ def validate_interactively(engine: Any, only_gated: bool = True) -> None:
     for p in pkgs:
         t = Table(title=f"{p.finding_id}  {escape(p.package_name)}@{escape(p.current_version)}  risk {p.risk_score}/100"
                         f"{'  production' if p.is_production else '  dev/test'}", show_lines=False)
-        for col in ("#", "Candidate", "Source", "Action", "Target", "SemVer", "Compat Risk", "Fit Score"):
+        for col in ("#", "Candidate", "Source", "Action", "Target", "SemVer", "Compat Risk", "Fit Score", "Risk (expected)"):
             t.add_column(col)
         for i, c in enumerate(p.candidates, 1):
             rec = " *" if c.candidate_id == p.recommended_candidate_id else ""
             t.add_row(str(i), c.candidate_id + rec, c.source + (f" +{','.join(c.also_reported_by)}" if c.also_reported_by else ""),
-                      c.action_type.value, escape(c.target_version_or_ref), c.semver_jump, c.compatibility_risk.value, str(c.fit_score))
+                      c.action_type.value, escape(c.target_version_or_ref), c.semver_jump, c.compatibility_risk.value, str(c.fit_score),
+                      f"{c.expected_risk_before} -> {c.expected_risk_after}" if c.expected_risk_before is not None else "-")
         con.print(t)
         for r in p.escalation_reasons:
             con.print(f"  [yellow]gate:[/] {escape(r)}")

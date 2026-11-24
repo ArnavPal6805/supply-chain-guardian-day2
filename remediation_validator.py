@@ -59,6 +59,7 @@ class ValidationResult(BaseModel):
     new_vs_baseline: List[FindingState] = Field(default_factory=list)
     risk: Dict[str, Any] = Field(default_factory=dict)
     graph_consistency: Dict[str, Any] = Field(default_factory=dict)
+    sbom_diff: Dict[str, Any] = Field(default_factory=dict)   # vs the pristine baseline: added / removed / changed packages
     changes_verified: List[ChangeCheck] = Field(default_factory=list)
     tests: Dict[str, Any] = Field(default_factory=dict)
     verdict: str = "baseline"            # baseline | improved | no_change | regressed | error
@@ -101,6 +102,22 @@ def risk_summary(states: List[FindingState]) -> Dict[str, Any]:
         by[s.severity] = by.get(s.severity, 0) + 1
     return {"max": max((s.score for s in states), default=0), "total": sum(s.score for s in states),
             "count": len(states), "by_severity": by}
+
+
+def inventory(sbom: Sbom) -> Dict[str, List[str]]:
+    inv: Dict[str, set] = {}
+    for c in sbom.components:
+        inv.setdefault(c.name, set()).add(c.version)
+    return {k: sorted(v) for k, v in inv.items()}
+
+
+def sbom_diff(before: Dict[str, List[str]], after: Dict[str, List[str]]) -> Dict[str, Any]:
+    added = sorted(f"{n}@{'/'.join(after[n])}" for n in after if n not in before)
+    removed = sorted(f"{n}@{'/'.join(before[n])}" for n in before if n not in after)
+    changed = [{"name": n, "from": before[n], "to": after[n]} for n in sorted(after) if n in before and before[n] != after[n]]
+    return {"counts": {"added": len(added), "removed": len(removed), "changed": len(changed),
+                       "before": len(before), "after": len(after)},
+            "added": added[:200], "removed": removed[:200], "changed": changed[:200]}
 
 
 def check_graph_consistency(ws: Workspace, sbom: Sbom) -> Dict[str, Any]:
@@ -207,7 +224,8 @@ def verify_changes(ws: Workspace, changes: List[Change], sbom: Sbom) -> List[Cha
 
 def validate(ws: Workspace, iteration: int, log: LogFn, baseline: Optional[ValidationResult] = None,
              previous: Optional[ValidationResult] = None, changes: Optional[List[Change]] = None,
-             run_tests: bool = False, out: Optional[Dict[str, Any]] = None) -> ValidationResult:
+             run_tests: bool = False, out: Optional[Dict[str, Any]] = None,
+             baseline_inventory: Optional[Dict[str, List[str]]] = None) -> ValidationResult:
     t0 = time.time()
     res = ValidationResult(iteration=iteration)
     log("validator-agent", f"iteration {iteration}: independent re-scan of the candidate workspace", "tool")
@@ -217,8 +235,11 @@ def validate(ws: Workspace, iteration: int, log: LogFn, baseline: Optional[Valid
         res.verdict, res.errors = "error", [f"scan failed: {type(exc).__name__}: {str(exc)[:300]}"]
         res.seconds = round(time.time() - t0, 1)
         return res
+    inv = inventory(scan["sbom"])
     if out is not None:
-        out["scan"] = scan
+        out["scan"], out["inventory"] = scan, inv
+    if baseline_inventory is not None:
+        res.sbom_diff = sbom_diff(baseline_inventory, inv)
     res.sbom_source, res.components, res.vuln_source = scan["sbom"].source, len(scan["sbom"].components), scan["vuln_source"]
     res.findings = states_of(scan)
     res.risk = risk_summary(res.findings)
@@ -245,7 +266,10 @@ def validate(ws: Workspace, iteration: int, log: LogFn, baseline: Optional[Valid
     if bad:
         res.notes.append(f"changes not effective: {', '.join(bad)}")
     if res.tests.get("status") == "failed":
-        res.notes.append("tests failed in the sandbox")
+        res.notes.append(f"{res.tests.get('phase', 'test')} failed in the sandbox")
+    if res.sbom_diff.get("counts", {}).get("added"):
+        res.notes.append(f"{res.sbom_diff['counts']['added']} dependency(ies) introduced: "
+                         + ", ".join(res.sbom_diff["added"][:5]) + (" …" if res.sbom_diff["counts"]["added"] > 5 else ""))
     if baseline is None:
         res.verdict = "baseline"
     else:

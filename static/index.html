@@ -133,8 +133,8 @@
           <div class="text-[11px] text-slate-300">The agent investigates, changes an <b>isolated copy</b> of the repository with typed tools, and an independent validator re-scans after every iteration. Nothing touches the real repository until you approve individual changes below.</div>
           <div class="flex flex-wrap items-center gap-3 text-[11px]">
             <label class="flex items-center gap-1">iterations <select id="remIters" class="bg-ink-850 border border-ink-600 rounded px-1 py-0.5"><option>1</option><option>2</option><option>3</option><option>4</option><option selected>5</option><option>6</option><option>7</option><option>8</option></select></label>
-            <label class="flex items-center gap-1" title="Runs the project's own tests inside a Docker container with no network"><input id="remTests" type="checkbox" class="accent-sky-500">sandboxed tests (Docker)</label>
-            <label class="flex items-center gap-1"><input id="remLlm" type="checkbox" class="accent-sky-500" checked>use Gemini (else deterministic policy)</label>
+            <label class="flex items-center gap-1" title="Runs the project's own build and tests inside a Docker container with no network"><input id="remTests" type="checkbox" class="accent-sky-500">sandboxed build + tests (Docker)</label>
+            <label class="flex items-center gap-1"><input id="remLlm" type="checkbox" class="accent-sky-500" checked>use the LLM (else deterministic policy)</label>
             <button id="remStart" class="rounded px-2.5 py-1 font-semibold bg-sky-600 hover:bg-sky-500 text-white">Run agent on top findings</button>
             <button id="remStop" class="hidden rounded px-2.5 py-1 font-semibold bg-red-700 hover:bg-red-600 text-white">Stop</button>
           </div>
@@ -611,6 +611,7 @@ function mitigationPanelHtml(fid) {
         <span class="font-mono text-[11px] text-slate-100 break-all">${esc(c.target_version_or_ref)}</span>
         <span class="text-[10px] font-mono text-slate-400">${esc(c.semver_jump)}</span>
         <span class="text-[10px] font-mono px-1.5 rounded ${COMPAT_STYLE[c.compatibility_risk]}">${esc(c.compatibility_risk)} compat</span>
+        ${c.expected_risk_before != null ? `<span class="text-[10px] font-mono px-1.5 rounded ${c.expected_risk_after < c.expected_risk_before ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-500/20 text-slate-300"}" title="${esc(c.expected_note)}">risk ${esc(c.expected_risk_before)} → ${esc(c.expected_risk_after)}</span>` : ""}
         <span class="ml-auto font-mono text-[11px] text-slate-200" title="${esc(c.fit_breakdown.join(" · "))}">fit ${esc(c.fit_score)}</span>
       </div>
       ${brk}
@@ -694,6 +695,18 @@ function diffHtml(d) {
 function remDetails(id, summary, body) {
   return `<details data-remopen="${esc(id)}" class="rounded border border-ink-700 bg-ink-850" ${state.remOpen.has(id) ? "open" : ""}><summary class="px-2 py-1.5">${summary}</summary><div class="px-2 pb-2 space-y-1">${body}</div></details>`;
 }
+function sbomDiffHtml(sd) {
+  if (!sd || !sd.counts) return "";
+  const c = sd.counts;
+  const list = (arr, cls) => arr.length ? `<div class="${cls} font-mono text-[10px] break-all">${arr.slice(0, 40).map(esc).join(", ")}${arr.length > 40 ? " …" : ""}</div>` : "";
+  const changed = sd.changed.slice(0, 40).map((x) => `${esc(x.name)} ${esc(x.from.join("/"))}→${esc(x.to.join("/"))}`).join(", ");
+  return `<details class="mt-1"><summary class="text-[10.5px] text-sky-400">SBOM vs baseline: ${c.before} → ${c.after} packages · <span class="text-emerald-300">+${c.added}</span> <span class="text-red-300">−${c.removed}</span> <span class="text-amber-300">~${c.changed}</span></summary>
+    ${list(sd.added, "text-emerald-300")}${list(sd.removed, "text-red-300")}${changed ? `<div class="text-amber-300 font-mono text-[10px] break-all">${changed}</div>` : ""}</details>`;
+}
+function testsHtml(t) {
+  if (!t || !t.phases) return `tests ${esc((t && t.status) || "n/a")}${t && t.reason ? " (" + esc(t.reason) + ")" : ""}`;
+  return Object.entries(t.phases).map(([k, v]) => `${esc(k)} <b class="${v.status === "passed" ? "text-emerald-300" : v.status === "skipped" ? "text-slate-400" : "text-red-300"}">${esc(v.status)}</b>`).join(" · ");
+}
 function renderRem(d) {
   const m = d && d.session;
   $("#remDot").className = `inline-block w-1.5 h-1.5 rounded-full align-middle ${d && d.running ? "bg-sky-400 animate-pulse" : m ? "bg-emerald-400" : "bg-slate-600"}`;
@@ -719,7 +732,7 @@ function renderRem(d) {
         <div class="font-mono text-[10px] text-slate-400 break-all">${esc(x.observation.slice(0, 400))}</div></div></div>`).join("");
     const v = m.validations.filter((x) => x.iteration === it).slice(-1)[0];
     const vhtml = v ? `<div class="mt-1 rounded bg-ink-950/60 border border-ink-700 p-1.5 text-[11px]"><b class="${VERDICT[v.verdict]}">validator: ${esc(v.verdict)}</b> · max risk ${esc(v.risk.max)} · total ${esc(v.risk.total)} · resolved vs baseline ${v.resolved_vs_baseline.length} · new ${v.new_vs_baseline.length}
-      · graph ${v.graph_consistency.ok ? "consistent" : "INCONSISTENT"} · tests ${esc(v.tests.status)}${(v.notes || []).length ? `<div class="text-amber-300">${v.notes.map(esc).join("; ")}</div>` : ""}
+      · graph ${v.graph_consistency.ok ? "consistent" : "INCONSISTENT"} · ${testsHtml(v.tests)}${(v.notes || []).length ? `<div class="text-amber-300">${v.notes.map(esc).join("; ")}</div>` : ""}${sbomDiffHtml(v.sbom_diff)}
       <div class="text-slate-500">${v.changes_verified.map((c) => `${esc(c.change_id)} ${c.ok ? "✓" : "✗ " + esc(c.detail)}`).join(" · ")}</div></div>` : "";
     const plans = m.plans.filter((p) => p.iteration === it).map((p) => `<div class="text-[11px]"><b>plan:</b> ${esc(p.strategy)} — ${esc(p.rationale)}${p.alternatives_considered.length ? `<div class="text-slate-500">alternatives: ${p.alternatives_considered.map(esc).join("; ")}</div>` : ""}</div>`).join("");
     return remDetails(`it${it}`, `<b>Iteration ${it}</b> <span class="text-slate-500">${m.steps.filter((x) => x.iteration === it).length} tool calls</span> ${v ? `<span class="${VERDICT[v.verdict]}">· ${esc(v.verdict)}</span>` : ""}`, plans + steps + vhtml);
@@ -750,7 +763,7 @@ function renderRem(d) {
     ${m.status === "finished" && applied.length ? `<div class="rounded-md border border-emerald-900 bg-ink-850 p-2 space-y-2"><div class="text-[11px] text-slate-300">Approved changes are replayed on a fresh copy of the original and re-diffed. You confirm that exact diff before anything is written.</div>
       <button id="remPrepare" class="rounded px-2.5 py-1 font-semibold bg-emerald-600 hover:bg-emerald-500 text-white">Prepare approved changes</button><div id="remPrepared"></div></div>` : ""}
     ${fv ? `<div class="rounded-md border border-emerald-800 bg-emerald-950/20 p-2"><b class="text-emerald-300">Applied to the original repository</b>: ${esc((m.approval.written || []).join(", "))}
-      <div class="text-[11px] mt-1">final independent validation: <b class="${VERDICT[fv.verdict]}">${esc(fv.verdict)}</b> · max risk ${esc(fv.risk.max)} · resolved vs baseline ${fv.resolved_vs_baseline.length} · new ${fv.new_vs_baseline.length} · graph ${fv.graph_consistency.ok ? "consistent" : "INCONSISTENT"} · tests ${esc(fv.tests.status)}</div>
+      <div class="text-[11px] mt-1">final independent validation: <b class="${VERDICT[fv.verdict]}">${esc(fv.verdict)}</b> · max risk ${esc(fv.risk.max)} · resolved vs baseline ${fv.resolved_vs_baseline.length} · new ${fv.new_vs_baseline.length} · graph ${fv.graph_consistency.ok ? "consistent" : "INCONSISTENT"} · ${testsHtml(fv.tests)}</div>${sbomDiffHtml(fv.sbom_diff)}
       <div class="text-[10px] text-slate-500">Run a Full Scan to refresh the dashboard from the updated repository.</div></div>` : ""}`;
   if (state.remPrepared) renderPrepared(state.remPrepared);
 }

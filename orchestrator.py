@@ -57,7 +57,8 @@ from risk_engine import compute_risk, explain_deterministic
 from scanners import (ImportSite, LOCKFILES, fetch_advisory_and_changelog_context, read_text, reset_github_budget,
                       scan_text_for_sinks)
 from mitigation_engine import (HumanDecisionType, HumanValidationRecord, MitigationDecisionPackage,
-                               build_mitigation_options, deterministic_tradeoff_summary, validate_tradeoff_summary)
+                               build_mitigation_options, deterministic_tradeoff_summary, estimate_risk_reduction,
+                               validate_tradeoff_summary)
 
 # --------------------------------------------------------------------------- #
 # Live log bus (thread-safe fan-out to SSE subscribers and the console)
@@ -1054,6 +1055,15 @@ class Orchestrator:
             pkg = self.mitigation_for(f, online=online)
             if pkg is None:
                 continue
+            if f.kind == "vulnerability":
+                fixed_of = {v.id: v.fixed_in for v in self.ctx.vulns if v.purl == f.purl}
+                same = [x for x in self.ctx.tree.findings.values() if x.kind == "vulnerability" and x.purl == f.purl]
+                adv = [(x.advisory_ids[0], fixed_of.get(x.advisory_ids[0]), x.risk.total) for x in same if x.advisory_ids]
+            else:
+                adv = [(f.advisory_ids[0] if f.advisory_ids else f.id, None, f.risk.total)]
+            estimate_risk_reduction(pkg, adv, primary_advisory=f.advisory_ids[0] if f.advisory_ids else None,
+                                    dev_multiplier=0.6)
+            pkg.ai_tradeoff_summary = deterministic_tradeoff_summary(pkg)
             if self.use_llm and llm_left > 0 and (pkg.requires_human_validation or f.risk.severity in (Severity.CRITICAL, Severity.HIGH)) \
                     and self.llm_time_left():
                 llm_left -= 1

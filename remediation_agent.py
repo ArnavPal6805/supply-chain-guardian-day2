@@ -227,6 +227,14 @@ Rules:
   why it beats the alternatives.
 - Do not repeat an attempt listed under failed_attempts. If something cannot be fixed safely (would break called code,
   needs a source change, needs a digest you cannot verify), use request_human_review.
+- Work through ALL open targets, highest score first, not just one package. One change per package usually clears
+  every advisory on it (pick the candidate with the best fit that fixes all advisories). Never redo a change that is
+  already listed under applied_changes.
+- Strategy hints: vulnerable dependency -> update_dependency with a candidate version (mode auto picks direct pin or
+  override); install hook that downloads/executes code -> analyze_lifecycle_script then disable_lifecycle_script (it is
+  flagged high-impact, so a human still reviews it); unpinned CI action -> pin_github_action; tampered lockfile ->
+  restore_file_from_git; Docker base image -> request_human_review (digest must be verified by a person);
+  typosquat/malicious package -> replace_dependency or remove_dependency after checking imports.
 - End each iteration with request_validation once you changed something, or finish when nothing safe is left.
 
 TOOLS (name: arguments):
@@ -253,6 +261,7 @@ class LeadRemediationAgent:
         self.ws: Optional[Workspace] = None
         self.cur: Dict[str, Any] = {}                    # latest validator scan of the workspace
         self.baseline: Optional[ValidationResult] = None
+        self.baseline_inventory: Dict[str, List[str]] = {}
         self._step = 0
         self._started = time.time()
         self._finish_requested: Optional[str] = None
@@ -684,7 +693,8 @@ class LeadRemediationAgent:
         if not last or not self.baseline:
             return {"error": "no validation yet"}
         return {"resolved_vs_baseline": last.resolved_vs_baseline[:30], "new_vs_baseline": [s.key for s in last.new_vs_baseline][:20],
-                "risk_baseline": self.baseline.risk, "risk_now": last.risk, "verdict": last.verdict}
+                "risk_baseline": self.baseline.risk, "risk_now": last.risk, "verdict": last.verdict,
+                "sbom_diff": {k: (v[:20] if isinstance(v, list) else v) for k, v in last.sbom_diff.items()}}
 
     def t_calculate_risk(self, a: NoArgs) -> Any:
         last = self.mem.validations[-1] if self.mem.validations else self.baseline
@@ -755,11 +765,18 @@ class LeadRemediationAgent:
     def _open_targets(self) -> List[FindingStatus]:
         return [t for t in self.mem.targets if t.status == "unresolved"]
 
+    def _untouched_keys(self) -> List[str]:
+        """Open targets that no applied change has addressed and nobody has escalated yet."""
+        addressed = {k for c in self.mem.changes if c.status == "applied" for k in c.finding_ids}
+        return [t.key for t in self._open_targets() if t.key not in addressed]
+
     # ---- deterministic policy driver -------------------------------------------------------- #
-    def _policy_iteration(self) -> None:
+    def _policy_iteration(self, only_keys: Optional[set] = None) -> None:
         tried_units = set()
         acted = False
         for t in self._open_targets():
+            if only_keys is not None and t.key not in only_keys:
+                continue
             f = next((s for s in self.mem.current_findings if s.key == t.key), None)
             if f is None:
                 continue
@@ -862,9 +879,13 @@ class LeadRemediationAgent:
                 "last_validation": {"verdict": last.verdict, "risk": last.risk, "resolved_vs_baseline": last.resolved_vs_baseline[:20],
                                     "new_vs_baseline": [s.key for s in last.new_vs_baseline][:10], "notes": last.notes,
                                     "tests": last.tests.get("status"),
+                                    "sbom_diff_counts": last.sbom_diff.get("counts"),
                                     "changes_verified": [c.model_dump() for c in last.changes_verified][-8:]} if last else None,
                 "failed_attempts": [f.model_dump() for f in self.mem.failed_attempts][-12:],
-                "changes": [{"id": c.change_id, "tool": c.tool, "status": c.status, "impact": c.impact} for c in self.mem.changes]}
+                "applied_changes": [{"id": c.change_id, "tool": c.tool, "status": c.status, "impact": c.impact,
+                                     "what": {k: v for k, v in c.args.items() if k in ("name", "version", "mode", "script", "path", "new_name")},
+                                     "for_findings": c.finding_ids[:6]} for c in self.mem.changes],
+                "untouched_targets": self._untouched_keys()[:30]}
 
     def _llm_iteration(self) -> None:
         from orchestrator import LLMError, LLMUnavailable, redact
@@ -925,6 +946,7 @@ class LeadRemediationAgent:
         if self.baseline.verdict == "error":
             raise RuntimeError("baseline scan failed: " + "; ".join(self.baseline.errors))
         self.cur = out["scan"]
+        self.baseline_inventory = out["inventory"]
         self.mem.original_findings = list(self.baseline.findings)
         self.mem.current_findings = list(self.baseline.findings)
         self.mem.risk_history.append({"iteration": 0, **self.baseline.risk})
@@ -946,6 +968,15 @@ class LeadRemediationAgent:
             self._finish_requested = None
             if self.llm is not None:
                 self._llm_iteration()
+                made = [c for c in self.mem.changes[before:] if c.status == "applied"]
+                untouched = set(self._untouched_keys())
+                if not made and untouched and not self.stop_flag.is_set():
+                    # coverage safety net: the model ended the iteration without changing anything while findings
+                    # nobody has looked at remain; the deterministic policy handles exactly those
+                    self.log("agent", f"LLM made no change this iteration; the policy covers {len(untouched)} untouched finding(s)", "warn")
+                    self._audit("policy_fill_in", {"keys": sorted(untouched)})
+                    self._finish_requested = None
+                    self._policy_iteration(only_keys=untouched)
             else:
                 self._policy_iteration()
             new = [c for c in self.mem.changes[before:] if c.status == "applied"]
@@ -956,7 +987,8 @@ class LeadRemediationAgent:
             out = {}
             prev = self.mem.validations[-1] if self.mem.validations else self.baseline
             val = validate(self.ws, it, self.log, baseline=self.baseline, previous=prev,
-                           changes=[c for c in self.mem.changes if c.status == "applied"], run_tests=self.mem.run_tests, out=out)
+                           changes=[c for c in self.mem.changes if c.status == "applied"], run_tests=self.mem.run_tests, out=out,
+                           baseline_inventory=self.baseline_inventory)
             self.mem.validations.append(val)
             self._audit("validation", val.model_dump())
             if val.verdict == "error":
@@ -973,7 +1005,8 @@ class LeadRemediationAgent:
                 self.log("agent", f"iteration {it} regressed; rolled back {len(blamed)} of {len(new)} change(s)", "warn")
                 out = {}
                 val2 = validate(self.ws, it, self.log, baseline=self.baseline, previous=prev,
-                                changes=[c for c in self.mem.changes if c.status == "applied"], run_tests=False, out=out)
+                                changes=[c for c in self.mem.changes if c.status == "applied"], run_tests=False, out=out,
+                                baseline_inventory=self.baseline_inventory)
                 self.mem.validations.append(val2)
                 val = val2
             self.cur = out.get("scan", self.cur)
@@ -1125,7 +1158,8 @@ class LeadRemediationAgent:
             check = Workspace(self.ctx.repo, label="final")
             try:
                 final_val = validate(check, 99, self.log, baseline=self.baseline, previous=self.baseline,
-                                     changes=[c for c in self.mem.changes if c.change_id in p["accepted"]], run_tests=self.mem.run_tests)
+                                     changes=[c for c in self.mem.changes if c.change_id in p["accepted"]], run_tests=self.mem.run_tests,
+                                     baseline_inventory=self.baseline_inventory)
             finally:
                 check.cleanup()
             self.mem.final_validation = final_val
