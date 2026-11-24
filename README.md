@@ -1,4 +1,13 @@
-# Supply-Chain Guardian
+# Supply-Chain Guardian Team 6
+
+# Contributions:
+  | Member | Day 1 Contribution | Day 2 Contribution |
+|---|---|---|
+| **Arnav Pal** | SBOM generation, OSV scanning, vulnerability identification, fixed-version extraction, and remediation recommendations. | Improved vulnerability remediation logic, integration of findings with the agent, and dependency-aware fix recommendations. |
+| **Aditya Santosh** | Rule-based anomaly detection, typosquatting detection, suspicious package scripts, integrity checks, and package source analysis. | Extended anomaly detection with metadata and provenance checks, configuration analysis, baseline comparison, and LLM-assisted anomaly investigation. |
+| **Souri** | Dependency graph analysis, direct and transitive dependency tracing, root-cause identification, and risk scoring. | Attack-tree generation, Risk Elo prioritisation, dependency reachability analysis, and evidence-based remediation decisions. |
+| **M KAVYA** | Integration of scanning and analysis components, initial remediation workflow, and coordination of security findings. | Agentic remediation workflow, tool calling, autonomous planning, dependency modification, adaptive remediation, and iterative fix generation. |
+| **Saran J Palani ** | Scan result presentation, baseline comparison, reporting, and overall system integration. | Isolated remediation workspaces, post-fix validation, human approval, before-and-after comparison, and final reporting. |
 
 Continuous, **read-only** software supply-chain security: a pre-install admission gate, an
 evidence-backed attack tree, a deterministic 0-100 risk engine fed by OSV/NVD/EPSS/KEV, a constrained LLM triage agent
