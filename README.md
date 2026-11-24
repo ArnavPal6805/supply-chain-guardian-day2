@@ -1,4 +1,4 @@
-# Supply-Chain Guardian
+# Supply-Chain Guardian Team 6
 
 Continuous, **read-only** software supply-chain security: a pre-install admission gate, an
 evidence-backed attack tree with a locked Risk Elo formula, a constrained LLM triage agent
