@@ -5,3 +5,4 @@ __pycache__/
 .scg_cache/
 targets/
 *.sbom.json
+.env.example
